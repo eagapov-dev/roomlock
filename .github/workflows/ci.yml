@@ -1,0 +1,60 @@
+# Quality gate (rule Q-1) on every pull request and every push to main.
+# CI runs spotlessCheck (verify only); spotlessApply is a local-only step.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The Gradle toolchain requires Java 21 and auto-provisioning is disabled.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Gradle cache + wrapper checksum validation.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # Compilation, spotlessCheck, unit/slice/integration/concurrency tests
+      # (Testcontainers uses the Docker daemon of the ubuntu runner).
+      - name: Build
+        run: ./gradlew spotlessCheck build
+
+      - name: Upload JUnit reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-reports
+          path: |
+            **/build/test-results/test/
+            **/build/reports/tests/test/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload JaCoCo reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jacoco-reports
+          path: "**/build/reports/jacoco/test/"
+          if-no-files-found: ignore
+          retention-days: 14
