@@ -2,20 +2,14 @@ package dev.roomlock.booking;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import dev.roomlock.booking.support.TestClockConfig;
-import dev.roomlock.booking.support.TestcontainersConfig;
+import dev.roomlock.booking.support.BookingIntegrationTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
-import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.test.context.ActiveProfiles;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@ActiveProfiles(Profiles.TEST)
-@Import({TestcontainersConfig.class, TestClockConfig.class})
+@BookingIntegrationTest
 class BookingServiceApplicationIntegrationTest {
 
   @Autowired private TestRestTemplate rest;
