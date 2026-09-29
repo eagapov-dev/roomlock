@@ -1,0 +1,17 @@
+# Provider binaries and the backend's local scratch. Re-created by `tofu init`.
+.terraform/
+
+# State never belongs in git: it holds the generated database password, and the backend is a GCS
+# bucket (versions.tf). These patterns exist so a local `-backend=false` run cannot commit one.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Real variable values. terraform.tfvars.example is the committed template.
+terraform.tfvars
+*.auto.tfvars
+
+# Saved plans are binary and can contain resolved secret values.
+*.tfplan
+
+# .terraform.lock.hcl is deliberately NOT ignored: it pins provider checksums and is committed.
