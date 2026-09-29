@@ -31,12 +31,10 @@ public class RecordingNotificationSender implements NotificationSender {
     sent.add(notification);
   }
 
-  /** Everything delivered since the last {@link #clear()}, in delivery order. */
-  public List<GuestNotification> sent() {
-    return List.copyOf(sent);
-  }
-
-  /** Deliveries of one booking, so a leftover record of another test cannot change a count. */
+  /**
+   * Deliveries of one booking since the last {@link #clear()}, in delivery order: counting per
+   * booking keeps a record left over by another test from changing the count.
+   */
   public List<GuestNotification> sentFor(UUID bookingId) {
     return sent.stream()
         .filter(notification -> notification.bookingId().equals(bookingId))
