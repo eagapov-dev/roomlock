@@ -1,8 +1,10 @@
 package dev.roomlock.booking.hold;
 
+import dev.roomlock.booking.domain.Booking;
 import dev.roomlock.booking.domain.ResourceNotFoundException;
 import dev.roomlock.booking.infra.BookingRepository;
 import dev.roomlock.booking.infra.RoomRepository;
+import dev.roomlock.booking.outbox.BookingOutbox;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 
@@ -17,15 +19,18 @@ class PessimisticHoldStrategy extends TransactionalHoldStrategy {
 
   private final RoomRepository rooms;
   private final BookingRepository bookings;
+  private final BookingOutbox outbox;
 
   PessimisticHoldStrategy(
       PlatformTransactionManager transactionManager,
       HoldMetrics metrics,
       RoomRepository rooms,
-      BookingRepository bookings) {
+      BookingRepository bookings,
+      BookingOutbox outbox) {
     super(transactionManager, metrics, ATTEMPTS);
     this.rooms = rooms;
     this.bookings = bookings;
+    this.outbox = outbox;
   }
 
   @Override
@@ -42,6 +47,8 @@ class PessimisticHoldStrategy extends TransactionalHoldStrategy {
         attempt.roomId(), attempt.stay().checkIn(), attempt.stay().checkOut())) {
       return new HoldOutcome.Busy();
     }
-    return new HoldOutcome.Inserted(bookings.saveAndFlush(attempt.newBooking()));
+    Booking booking = bookings.saveAndFlush(attempt.newBooking());
+    outbox.recordHeld(booking);
+    return new HoldOutcome.Inserted(booking);
   }
 }

@@ -6,6 +6,10 @@ import java.util.List;
 import java.util.UUID;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
 
@@ -16,16 +20,29 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
   long countByPublishedAtIsNull();
 
   /**
-   * Marks the event published unless another publisher did it first.
+   * Marks the event published (rule DB-5). The {@code IS NULL} is the transition itself: of two
+   * publishers that sent the same event, only one marks it, and the other learns it was a
+   * duplicate.
    *
    * @return 1 if this call marked it, 0 if it was already marked
    */
-  default int markPublished(UUID eventId, Instant publishedAt) {
-    throw new UnsupportedOperationException("Not implemented yet");
-  }
+  @Modifying(clearAutomatically = true)
+  @Transactional
+  @Query(
+      value =
+          """
+          UPDATE outbox_event
+          SET published_at = CAST(:publishedAt AS timestamptz)
+          WHERE id = :eventId AND published_at IS NULL
+          """,
+      nativeQuery = true)
+  int markPublished(@Param("eventId") UUID eventId, @Param("publishedAt") Instant publishedAt);
 
-  /** Counts a publish that failed, so a stuck event can be told from a fresh one. */
-  default int recordAttempt(UUID eventId) {
-    throw new UnsupportedOperationException("Not implemented yet");
-  }
+  /** Counts a publish that failed, so a stuck event can be told from a fresh one (rule DB-5). */
+  @Modifying(clearAutomatically = true)
+  @Transactional
+  @Query(
+      value = "UPDATE outbox_event SET attempts = attempts + 1 WHERE id = :eventId",
+      nativeQuery = true)
+  int recordAttempt(@Param("eventId") UUID eventId);
 }

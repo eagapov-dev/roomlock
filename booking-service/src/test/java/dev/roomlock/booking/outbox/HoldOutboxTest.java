@@ -10,8 +10,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.roomlock.booking.domain.Booking;
+import dev.roomlock.booking.hold.HoldOutcome;
 import dev.roomlock.booking.hold.HoldResult;
 import dev.roomlock.booking.hold.HoldService;
+import dev.roomlock.booking.hold.HoldStrategies;
+import dev.roomlock.booking.hold.LockingStrategy;
 import dev.roomlock.booking.infra.HotelRepository;
 import dev.roomlock.booking.infra.RoomRepository;
 import dev.roomlock.booking.support.BookingIntegrationTest;
@@ -21,6 +24,8 @@ import dev.roomlock.booking.support.TestData.HoldDraft;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 
 /**
@@ -33,6 +38,7 @@ class HoldOutboxTest {
   private static final String BOOKING_HELD = "BookingHeld";
 
   @Autowired private HoldService holds;
+  @Autowired private HoldStrategies strategies;
   @Autowired private OutboxTable outbox;
   @Autowired private ObjectMapper json;
   @Autowired private DatabaseCleaner databaseCleaner;
@@ -58,13 +64,16 @@ class HoldOutboxTest {
 
     // then
     assertThat(outbox.typesOf(booking.getId())).containsExactly(BOOKING_HELD);
-    JsonNode event = json.readTree(outbox.payloadOf(booking.getId()));
+    String payload = outbox.payloadOf(booking.getId());
+    // The price keeps its two decimals through jsonb, which re-renders the document it stores;
+    // reading the number back with readTree would turn it into a double.
+    assertThat(payload).contains("\"totalPrice\": 450.00");
+    JsonNode event = json.readTree(payload);
     assertThat(event.path("bookingId").asText()).isEqualTo(booking.getId().toString());
     assertThat(event.path("roomId").asText()).isEqualTo(roomId.toString());
     assertThat(event.path("guestId").asText()).isEqualTo(draft.guestId().toString());
     assertThat(event.path("checkIn").asText()).isEqualTo("2026-11-10");
     assertThat(event.path("checkOut").asText()).isEqualTo("2026-11-13");
-    assertThat(event.path("totalPrice").asText()).isEqualTo("450.00");
     assertThat(event.path("currency").asText()).isEqualTo("PLN");
     assertThat(event.path("holdExpiresAt").asText())
         .isEqualTo(booking.getHoldExpiresAt().toString());
@@ -99,6 +108,21 @@ class HoldOutboxTest {
     // then
     assertThat(outbox.typesOf(booking.getId())).containsExactly(BOOKING_HELD);
     assertThat(outbox.count()).isEqualTo(1);
+  }
+
+  /** Whichever strategy inserted the booking, the event is part of the same transaction. */
+  @ParameterizedTest
+  @EnumSource(LockingStrategy.class)
+  void shouldWriteHeldEventWhateverStrategyHoldsTheRoom(LockingStrategy strategy) {
+    // given
+    HoldDraft draft = aHold().withRoomId(roomId);
+
+    // when
+    HoldOutcome outcome = strategies.get(strategy).hold(draft.attempt());
+
+    // then
+    Booking booking = ((HoldOutcome.Inserted) outcome).booking();
+    assertThat(outbox.typesOf(booking.getId())).containsExactly(BOOKING_HELD);
   }
 
   @Test
