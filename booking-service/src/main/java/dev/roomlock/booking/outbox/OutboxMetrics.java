@@ -19,10 +19,14 @@ public class OutboxMetrics {
   /** Events still waiting, the backlog a dashboard watches instead of guessing the lag. */
   static final String UNPUBLISHED = "roomlock.outbox.unpublished";
 
+  /** Waiting events the broker keeps refusing: an outage that has become a stuck event. */
+  static final String STUCK = "roomlock.outbox.stuck";
+
   private final Counter published;
   private final Counter failures;
 
-  public OutboxMetrics(MeterRegistry registry, OutboxEventRepository events) {
+  public OutboxMetrics(
+      MeterRegistry registry, OutboxEventRepository events, OutboxProperties properties) {
     this.published =
         Counter.builder(PUBLISHED)
             .description("Events published from the outbox")
@@ -31,6 +35,13 @@ public class OutboxMetrics {
         Counter.builder(FAILURES).description("Events the broker refused").register(registry);
     Gauge.builder(UNPUBLISHED, events, OutboxEventRepository::countByPublishedAtIsNull)
         .description("Events the outbox still holds")
+        .register(registry);
+    int stuckAfter = properties.stuckAfter();
+    Gauge.builder(
+            STUCK,
+            events,
+            all -> all.countByPublishedAtIsNullAndAttemptsGreaterThanEqual(stuckAfter))
+        .description("Events the broker has refused " + stuckAfter + " times or more")
         .register(registry);
   }
 

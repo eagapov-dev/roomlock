@@ -54,6 +54,8 @@ roomlock:
     interval: PT1S
     # Events one sweep publishes at most.
     batch-size: 100
+    # Refusals after which an event is reported as stuck rather than as a passing outage.
+    stuck-after: 10
   payment:
     # A charge that takes longer than this is given up on; the booking stays PAYING and the sweep
     # below finishes it.

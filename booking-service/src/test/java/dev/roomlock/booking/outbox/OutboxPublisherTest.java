@@ -29,9 +29,11 @@ class OutboxPublisherTest {
   private static final String BOOKING_HELD = "BookingHeld";
   private static final String BOOKING_CANCELLED = "BookingCancelled";
   private static final int BATCH_SIZE = 2;
+  private static final int STUCK_AFTER = 3;
   private static final String PUBLISHED_COUNTER = "roomlock.outbox.published";
   private static final String FAILED_COUNTER = "roomlock.outbox.failures";
   private static final String BACKLOG_GAUGE = "roomlock.outbox.unpublished";
+  private static final String STUCK_GAUGE = "roomlock.outbox.stuck";
 
   @Autowired private OutboxEventRepository events;
   @Autowired private OutboxTable outbox;
@@ -113,6 +115,57 @@ class OutboxPublisherTest {
   }
 
   @Test
+  void shouldKeepPublishingOtherBookingsWhenOneEventIsRefused() {
+    // given the refused event of one booking, and another booking waiting behind it
+    UUID refusedBooking = UUID.randomUUID();
+    UUID refused = pending(refusedBooking, BOOKING_HELD, NOW);
+    UUID otherBooking = UUID.randomUUID();
+    UUID other = pending(otherBooking, BOOKING_HELD, NOW.plusSeconds(1));
+
+    // when
+    int published = publisher(new RefusingSender(refused)).publishBatch();
+
+    // then only the booking that cannot be published waits
+    assertThat(published).isEqualTo(1);
+    assertThat(outbox.publishedAt(other)).contains(NOW);
+    assertThat(outbox.publishedAt(refused)).isEmpty();
+  }
+
+  @Test
+  void shouldHoldBackTheRestOfTheBookingWhenItsEarlierEventIsRefused() {
+    // given a hold that cannot be published and the cancellation of the same booking behind it
+    UUID bookingId = UUID.randomUUID();
+    UUID refused = pending(bookingId, BOOKING_HELD, NOW);
+    UUID later = pending(bookingId, BOOKING_CANCELLED, NOW.plusSeconds(1));
+
+    // when
+    publisher(new RefusingSender(refused)).publishBatch();
+
+    // then a cancellation never overtakes the hold it cancels
+    assertThat(outbox.publishedAt(later)).isEmpty();
+  }
+
+  @Test
+  void shouldCountAnEventAsStuckWhenTheBrokerKeepsRefusingIt() {
+    // given an event that has already been refused as often as the configuration allows
+    UUID bookingId = UUID.randomUUID();
+    UUID refused = pending(bookingId, BOOKING_HELD, NOW);
+    OutboxPublisher publisher = publisher(new RefusingSender(refused));
+    for (int sweep = 1; sweep < STUCK_AFTER; sweep++) {
+      publisher.publishBatch();
+    }
+    assertThat(registry.get(STUCK_GAUGE).gauge().value()).isZero();
+
+    // when
+    publisher.publishBatch();
+
+    // then it is still kept, and it is visible as stuck rather than as a passing outage
+    assertThat(outbox.attempts(refused)).isEqualTo(STUCK_AFTER);
+    assertThat(registry.get(STUCK_GAUGE).gauge().value()).isEqualTo(1);
+    assertThat(outbox.publishedAt(refused)).isEmpty();
+  }
+
+  @Test
   void shouldSendTheRefusedEventWhenTheNextSweepFindsTheBrokerBack() {
     // given
     UUID bookingId = UUID.randomUUID();
@@ -154,17 +207,17 @@ class OutboxPublisherTest {
     return "{\"eventId\":\"" + UUID.randomUUID() + "\"}";
   }
 
+  private static OutboxProperties properties() {
+    return new OutboxProperties(Duration.ofSeconds(1), BATCH_SIZE, STUCK_AFTER);
+  }
+
   private OutboxPublisher publisher() {
     return publisher(sender);
   }
 
   private OutboxPublisher publisher(EventSender broker) {
     return new OutboxPublisher(
-        events,
-        broker,
-        new OutboxProperties(Duration.ofSeconds(1), BATCH_SIZE),
-        clock,
-        new OutboxMetrics(registry, events));
+        events, broker, properties(), clock, new OutboxMetrics(registry, events, properties()));
   }
 
   /** A broker that takes everything and remembers what it took. */

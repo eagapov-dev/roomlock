@@ -20,6 +20,11 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
   long countByPublishedAtIsNull();
 
   /**
+   * How many waiting events have been refused at least this often, which is no longer an outage.
+   */
+  long countByPublishedAtIsNullAndAttemptsGreaterThanEqual(int attempts);
+
+  /**
    * Marks the event published (rule DB-5). The {@code IS NULL} is the transition itself: of two
    * publishers that sent the same event, only one marks it, and the other learns it was a
    * duplicate.
