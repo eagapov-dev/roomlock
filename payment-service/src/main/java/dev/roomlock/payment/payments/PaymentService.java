@@ -31,22 +31,39 @@ public class PaymentService {
 
   private final PaymentRepository payments;
   private final ChargeRule rule;
+  private final PaymentMetrics metrics;
   private final Clock clock;
 
-  public PaymentService(PaymentRepository payments, ChargeRule rule, Clock clock) {
+  public PaymentService(
+      PaymentRepository payments, ChargeRule rule, PaymentMetrics metrics, Clock clock) {
     this.payments = payments;
     this.rule = rule;
+    this.metrics = metrics;
     this.clock = clock;
   }
 
   /** Charges the booking, or answers what the charge of this booking answered the first time. */
   @Transactional
   public ChargeResult charge(ChargeCommand command) {
+    ChargeResult result = metrics.timed(() -> decide(command));
+    metrics.charged(result);
+    return result;
+  }
+
+  /** Gives the money of the booking back, or says why there is nothing to give back. */
+  @Transactional
+  public RefundResult refund(RefundCommand command) {
+    RefundResult result = giveBack(command);
+    metrics.refunded(result);
+    return result;
+  }
+
+  private ChargeResult decide(ChargeCommand command) {
     Optional<Payment> recorded = payments.findByBookingId(command.bookingId());
     if (recorded.isPresent()) {
       return replayOf(recorded.get(), command);
     }
-    Payment payment = decide(command);
+    Payment payment = decidedPayment(command);
     if (payments.insertIfBookingFree(payment) == 0) {
       return replayOfRace(command);
     }
@@ -60,9 +77,7 @@ public class PaymentService {
     return new ChargeResult.Charged(payment);
   }
 
-  /** Gives the money of the booking back, or says why there is nothing to give back. */
-  @Transactional
-  public RefundResult refund(RefundCommand command) {
+  private RefundResult giveBack(RefundCommand command) {
     Instant now = clock.instant();
     boolean refundedNow = payments.markRefunded(command.bookingId(), now) == 1;
     Optional<Payment> recorded = payments.findByBookingId(command.bookingId());
@@ -78,7 +93,7 @@ public class PaymentService {
     return notRefundedNow(payment);
   }
 
-  private Payment decide(ChargeCommand command) {
+  private Payment decidedPayment(ChargeCommand command) {
     ChargeDecision decision = rule.decide(command);
     Instant now = clock.instant();
     if (decision.approved()) {
