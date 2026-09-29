@@ -4,6 +4,55 @@ spring:
   threads:
     virtual:
       enabled: true
+  flyway:
+    locations: classpath:db/migration
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  datasource:
+    # Local run against infra/docker-compose (host port 5433); the container overrides SPRING_DATASOURCE_*.
+    url: jdbc:postgresql://localhost:5433/notification
+    username: roomlock
+    password: roomlock
+    hikari:
+      maximum-pool-size: 10
+  kafka:
+    # Local run against the EXTERNAL listener of infra/docker-compose; the container overrides
+    # SPRING_KAFKA_BOOTSTRAP_SERVERS with kafka:9092 (INTERNAL).
+    bootstrap-servers: localhost:9094
+    consumer:
+      group-id: notification-service
+      # A new deployment reads the whole topic: the notification table, not the offset, is what
+      # keeps a guest from being told twice.
+      auto-offset-reset: earliest
+      # The container commits, and only after the handler returned.
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # The type is in the event-type header, so the payload stays raw JSON until BookingEventReader
+      # knows which record of the contract to read it as.
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      # Only the dead-letter publisher produces, and it forwards the record as it arrived.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    listener:
+      ack-mode: record
+
+# Consumer settings of the service (NotificationProperties).
+roomlock:
+  notifications:
+    # Topics.BOOKING_EVENTS of the contract.
+    topic: roomlock.booking-events.v1
+    # Where a record the consumer cannot handle is parked, next to the topic it came from.
+    dead-letter-suffix: .DLT
+    retry:
+      attempts: 2
+      backoff: 1s
 
 server:
   port: 8082
@@ -13,3 +62,15 @@ management:
     web:
       exposure:
         include: health, prometheus
+
+---
+# Tests: Testcontainers infrastructure, and no waiting between retries (rule T-7).
+spring:
+  config:
+    activate:
+      on-profile: test
+
+roomlock:
+  notifications:
+    retry:
+      backoff: 0s
