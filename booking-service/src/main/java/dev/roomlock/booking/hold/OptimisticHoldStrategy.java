@@ -19,10 +19,11 @@ class OptimisticHoldStrategy extends TransactionalHoldStrategy {
 
   OptimisticHoldStrategy(
       PlatformTransactionManager transactionManager,
+      HoldMetrics metrics,
       RoomRepository rooms,
       BookingRepository bookings,
       LockingProperties properties) {
-    super(transactionManager, properties.maxAttempts());
+    super(transactionManager, metrics, properties.maxAttempts());
     this.rooms = rooms;
     this.bookings = bookings;
   }

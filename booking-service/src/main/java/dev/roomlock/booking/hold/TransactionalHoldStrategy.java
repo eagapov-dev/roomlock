@@ -21,22 +21,34 @@ abstract class TransactionalHoldStrategy implements HoldStrategy {
   private static final Logger log = LoggerFactory.getLogger(TransactionalHoldStrategy.class);
 
   private final TransactionTemplate transactions;
+  private final HoldMetrics metrics;
   private final int maxAttempts;
 
-  TransactionalHoldStrategy(PlatformTransactionManager transactionManager, int maxAttempts) {
+  TransactionalHoldStrategy(
+      PlatformTransactionManager transactionManager, HoldMetrics metrics, int maxAttempts) {
     this.transactions = new TransactionTemplate(transactionManager);
+    this.metrics = metrics;
     this.maxAttempts = Math.max(1, maxAttempts);
   }
 
+  /**
+   * Runs the attempts of this strategy and reports them: every attempt is timed, every attempt past
+   * the first one counts as a retry, and the answer this returns is counted once.
+   */
   @Override
   public final HoldOutcome hold(HoldAttempt attempt) {
+    LockingStrategy strategy = strategy();
     HoldOutcome outcome = new HoldOutcome.Contended();
     for (int number = 1; number <= maxAttempts; number++) {
-      outcome = attemptOnce(attempt);
+      if (number > 1) {
+        metrics.retried(strategy);
+      }
+      outcome = metrics.timed(strategy, () -> attemptOnce(attempt));
       if (!(outcome instanceof HoldOutcome.Contended)) {
-        return outcome;
+        break;
       }
     }
+    metrics.answered(strategy, outcome);
     return outcome;
   }
 
