@@ -30,9 +30,6 @@ import org.springframework.lang.Nullable;
 @TestComponent
 public class BookingEventPublisher implements AutoCloseable {
 
-  /** The header the type of an event travels in, see {@link BookingEvent#type()}. */
-  public static final String EVENT_TYPE_HEADER = "event-type";
-
   private static final long SEND_TIMEOUT_SECONDS = 30;
 
   private final Producer<String, String> producer;
@@ -59,7 +56,9 @@ public class BookingEventPublisher implements AutoCloseable {
     ProducerRecord<String, String> record =
         new ProducerRecord<>(Topics.BOOKING_EVENTS, key, payload);
     if (eventType != null) {
-      record.headers().add(EVENT_TYPE_HEADER, eventType.getBytes(StandardCharsets.UTF_8));
+      record
+          .headers()
+          .add(BookingEvent.EVENT_TYPE_HEADER, eventType.getBytes(StandardCharsets.UTF_8));
     }
     send(record);
   }

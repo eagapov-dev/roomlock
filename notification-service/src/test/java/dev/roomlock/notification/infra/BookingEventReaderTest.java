@@ -12,7 +12,6 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import dev.roomlock.contract.v1.BookingEvent;
 import dev.roomlock.contract.v1.BookingHeld;
 import dev.roomlock.contract.v1.Topics;
-import dev.roomlock.notification.support.BookingEventPublisher;
 import java.nio.charset.StandardCharsets;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.Test;
@@ -76,7 +75,7 @@ class BookingEventReaderTest {
     // when, then
     assertThatThrownBy(() -> reader.read(record))
         .isInstanceOf(UnreadableEventException.class)
-        .hasMessageContaining(BookingEventPublisher.EVENT_TYPE_HEADER);
+        .hasMessageContaining(BookingEvent.EVENT_TYPE_HEADER);
   }
 
   private static ConsumerRecord<String, String> recordOf(
@@ -86,7 +85,7 @@ class BookingEventReaderTest {
     if (eventType != null) {
       record
           .headers()
-          .add(BookingEventPublisher.EVENT_TYPE_HEADER, eventType.getBytes(StandardCharsets.UTF_8));
+          .add(BookingEvent.EVENT_TYPE_HEADER, eventType.getBytes(StandardCharsets.UTF_8));
     }
     return record;
   }

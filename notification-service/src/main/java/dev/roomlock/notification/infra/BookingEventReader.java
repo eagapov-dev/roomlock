@@ -25,9 +25,6 @@ import org.springframework.stereotype.Component;
 @Component
 class BookingEventReader {
 
-  /** The header {@link BookingEvent#type()} travels in, as the contract describes. */
-  static final String EVENT_TYPE_HEADER = "event-type";
-
   /** Every type of the contract, including the one notifications ignore (rule K-2). */
   private static final Map<String, Class<? extends BookingEvent>> TYPES =
       Map.of(
@@ -46,12 +43,17 @@ class BookingEventReader {
   BookingEvent read(ConsumerRecord<String, String> record) {
     String type = eventType(record);
     if (type == null) {
-      throw new UnreadableEventException("No " + EVENT_TYPE_HEADER + " header on the record");
+      throw new UnreadableEventException(
+          "No " + BookingEvent.EVENT_TYPE_HEADER + " header on the record");
     }
     Class<? extends BookingEvent> eventClass = TYPES.get(type);
     if (eventClass == null) {
       throw new UnreadableEventException(
-          "Unknown " + EVENT_TYPE_HEADER + " '" + type + "', not a type of the contract");
+          "Unknown "
+              + BookingEvent.EVENT_TYPE_HEADER
+              + " '"
+              + type
+              + "', not a type of the contract");
     }
     String payload = record.value();
     if (payload == null) {
@@ -66,7 +68,7 @@ class BookingEventReader {
   }
 
   private static @Nullable String eventType(ConsumerRecord<String, String> record) {
-    Header header = record.headers().lastHeader(EVENT_TYPE_HEADER);
+    Header header = record.headers().lastHeader(BookingEvent.EVENT_TYPE_HEADER);
     if (header == null || header.value() == null) {
       return null;
     }
