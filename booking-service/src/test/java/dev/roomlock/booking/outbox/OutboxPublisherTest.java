@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import dev.roomlock.booking.domain.OutboxEvent;
 import dev.roomlock.booking.infra.OutboxEventRepository;
+import dev.roomlock.booking.infra.PublisherLease;
 import dev.roomlock.booking.support.BookingJpaTest;
 import dev.roomlock.booking.support.DatabaseCleaner;
 import dev.roomlock.booking.support.MutableClock;
@@ -18,6 +19,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
  * Draining the outbox (task 4.2). The broker is a stub: what has to be pinned here is which rows go
@@ -30,22 +32,29 @@ class OutboxPublisherTest {
   private static final String BOOKING_CANCELLED = "BookingCancelled";
   private static final int BATCH_SIZE = 2;
   private static final int STUCK_AFTER = 3;
+  private static final Duration LEASE = Duration.ofSeconds(30);
+  private static final OutboxProperties.Retention RETENTION =
+      new OutboxProperties.Retention(Duration.ofHours(1), Duration.ofDays(7), 2);
   private static final String PUBLISHED_COUNTER = "roomlock.outbox.published";
   private static final String FAILED_COUNTER = "roomlock.outbox.failures";
   private static final String BACKLOG_GAUGE = "roomlock.outbox.unpublished";
   private static final String STUCK_GAUGE = "roomlock.outbox.stuck";
 
   @Autowired private OutboxEventRepository events;
+  // A plain component rather than a repository, so the JPA slice does not create it for us.
+  @Autowired private JdbcTemplate jdbc;
   @Autowired private OutboxTable outbox;
   @Autowired private MutableClock clock;
   @Autowired private DatabaseCleaner databaseCleaner;
 
   private final MeterRegistry registry = new SimpleMeterRegistry();
+  private PublisherLease lease;
   private final RecordingSender sender = new RecordingSender();
 
   @BeforeEach
   void setUp() {
     databaseCleaner.truncateAll();
+    lease = new PublisherLease(jdbc);
     clock.setInstant(NOW);
   }
 
@@ -167,18 +176,18 @@ class OutboxPublisherTest {
 
   @Test
   void shouldSendTheRefusedEventWhenTheNextSweepFindsTheBrokerBack() {
-    // given
-    UUID bookingId = UUID.randomUUID();
-    UUID event = pending(bookingId, BOOKING_HELD, NOW);
-    publisher(new RefusingSender(event)).publishBatch();
+    // given a broker that refuses once, and the one publisher of this instance
+    UUID event = pending(UUID.randomUUID(), BOOKING_HELD, NOW);
+    OutboxPublisher publisher = publisher(new RefusingOnceSender(event));
+    assertThat(publisher.publishBatch()).isZero();
 
     // when
-    int published = publisher().publishBatch();
+    int published = publisher.publishBatch();
 
     // then
     assertThat(published).isEqualTo(1);
-    assertThat(sender.sentIds()).containsExactly(event);
     assertThat(outbox.publishedAt(event)).contains(NOW);
+    assertThat(outbox.attempts(event)).isEqualTo(1);
   }
 
   @Test
@@ -199,6 +208,95 @@ class OutboxPublisherTest {
     assertThat(outbox.publishedAt(sent)).contains(NOW);
   }
 
+  @Test
+  void shouldSendNothingWhenAnotherInstanceHoldsTheLease() {
+    // given another instance took the lease a moment ago
+    assertThat(lease.heldBy(UUID.randomUUID(), NOW, LEASE)).isTrue();
+    pending(UUID.randomUUID(), BOOKING_HELD, NOW);
+
+    // when
+    int published = publisher().publishBatch();
+
+    // then
+    assertThat(published).isZero();
+    assertThat(sender.sentIds()).isEmpty();
+  }
+
+  @Test
+  void shouldTakeOverTheSweepWhenTheOtherLeaseHasExpired() {
+    // given a lease nobody renewed
+    UUID gone = UUID.randomUUID();
+    assertThat(lease.heldBy(gone, NOW.minus(LEASE).minusSeconds(1), LEASE)).isTrue();
+    UUID event = pending(UUID.randomUUID(), BOOKING_HELD, NOW);
+
+    // when
+    int published = publisher().publishBatch();
+
+    // then
+    assertThat(published).isEqualTo(1);
+    assertThat(outbox.publishedAt(event)).contains(NOW);
+  }
+
+  @Test
+  void shouldKeepSweepingWhenTheSameInstanceRenewsItsLease() {
+    // given
+    OutboxPublisher publisher = publisher();
+    pending(UUID.randomUUID(), BOOKING_HELD, NOW);
+    assertThat(publisher.publishBatch()).isEqualTo(1);
+    pending(UUID.randomUUID(), BOOKING_CANCELLED, NOW.plusSeconds(1));
+
+    // when the next sweep of the same instance runs, well inside its own lease
+    int published = publisher.publishBatch();
+
+    // then
+    assertThat(published).isEqualTo(1);
+  }
+
+  @Test
+  void shouldDeleteOnlyEventsThatWentOutLongAgoWhenPruning() {
+    // given
+    UUID old =
+        outbox.insertPublished(
+            UUID.randomUUID(),
+            BOOKING_HELD,
+            payload(),
+            NOW.minus(Duration.ofDays(30)),
+            NOW.minus(Duration.ofDays(30)));
+    UUID recent =
+        outbox.insertPublished(
+            UUID.randomUUID(), BOOKING_HELD, payload(), NOW.minusSeconds(60), NOW.minusSeconds(30));
+    UUID waiting = pending(UUID.randomUUID(), BOOKING_HELD, NOW.minus(Duration.ofDays(30)));
+
+    // when
+    int pruned = publisher().prunePublished();
+
+    // then an event still waiting is never pruned, whatever its age
+    assertThat(pruned).isEqualTo(1);
+    assertThat(events.findById(old)).isEmpty();
+    assertThat(events.findById(recent)).isPresent();
+    assertThat(events.findById(waiting)).isPresent();
+  }
+
+  @Test
+  void shouldPruneAtMostOneBatchWhenManyEventsAreOldEnough() {
+    // given three prunable events and a retention batch of two
+    for (int event = 0; event < 3; event++) {
+      outbox.insertPublished(
+          UUID.randomUUID(),
+          BOOKING_HELD,
+          payload(),
+          NOW.minus(Duration.ofDays(30)),
+          NOW.minus(Duration.ofDays(30)));
+    }
+
+    // when
+    int pruned = publisher().prunePublished();
+
+    // then
+    assertThat(pruned).isEqualTo(RETENTION.batchSize());
+    assertThat(events.count()).isEqualTo(1);
+  }
+
   private UUID pending(UUID aggregateId, String type, java.time.Instant createdAt) {
     return outbox.insertPending(aggregateId, type, payload(), createdAt);
   }
@@ -208,7 +306,7 @@ class OutboxPublisherTest {
   }
 
   private static OutboxProperties properties() {
-    return new OutboxProperties(Duration.ofSeconds(1), BATCH_SIZE, STUCK_AFTER);
+    return new OutboxProperties(Duration.ofSeconds(1), BATCH_SIZE, STUCK_AFTER, LEASE, RETENTION);
   }
 
   private OutboxPublisher publisher() {
@@ -217,7 +315,12 @@ class OutboxPublisherTest {
 
   private OutboxPublisher publisher(EventSender broker) {
     return new OutboxPublisher(
-        events, broker, properties(), clock, new OutboxMetrics(registry, events, properties()));
+        events,
+        lease,
+        broker,
+        properties(),
+        clock,
+        new OutboxMetrics(registry, events, properties()));
   }
 
   /** A broker that takes everything and remembers what it took. */
@@ -232,6 +335,26 @@ class OutboxPublisherTest {
 
     List<UUID> sentIds() {
       return List.copyOf(sent);
+    }
+  }
+
+  /** A broker that refuses one event the first time it is offered, and takes it afterwards. */
+  private static final class RefusingOnceSender implements EventSender {
+
+    private final UUID refusedOnce;
+    private boolean refused;
+
+    RefusingOnceSender(UUID refusedOnce) {
+      this.refusedOnce = refusedOnce;
+    }
+
+    @Override
+    public void send(OutboxEvent event) {
+      if (!refused && event.getId().equals(refusedOnce)) {
+        refused = true;
+        throw new EventSendFailedException(
+            "broker is unreachable", new IllegalStateException("no connection"));
+      }
     }
   }
 
