@@ -13,12 +13,34 @@ on:
           - constraint
           - optimistic
           - pessimistic
+      simulations:
+        description: Simulations of this run (holds = the three hold scenarios, payments = the three confirm-flow ones)
+        type: choice
+        default: all
+        options:
+          - all
+          - holds
+          - payments
+          - contention
+          - throughput
+          - idempotent-retry
+          - confirm-flow
+          - decline-flow
+          - idempotent-pay
+      payment_mode:
+        description: Decision mode of the payment provider; DECLINE_ALL declines every charge
+        type: choice
+        default: THRESHOLD
+        options:
+          - THRESHOLD
+          - APPROVE_ALL
+          - DECLINE_ALL
       users:
         description: Virtual users of the load phase
         type: number
         default: 50
       duration:
-        description: Seconds the throughput scenario keeps its users busy
+        description: Seconds the throughput and confirm-flow scenarios keep their users busy
         type: number
         default: 30
 
@@ -50,16 +72,38 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      # The compose file of a local run, and its healthcheck, but only the database:
-      # booking-service runs next to the stack so every run can pick its own strategy.
-      - name: Start PostgreSQL
-        run: docker compose -f infra/docker-compose.yml up -d --wait postgres
+      # The compose file of a local run, and its healthchecks, but only the infrastructure:
+      # the services run next to the stack so every run can pick its own strategy and its own
+      # payment decision mode. Kafka is part of it because the outbox publishes to it.
+      - name: Start PostgreSQL and Kafka
+        run: docker compose -f infra/docker-compose.yml up -d --wait postgres kafka
 
-      - name: Build booking-service
-        run: ./gradlew :booking-service:bootJar
+      - name: Build the services under test
+        run: ./gradlew :booking-service:bootJar :payment-service:bootJar
+
+      # The confirm flow charges over gRPC, so the provider has to answer: roomlock.payment.decision.*
+      # as environment variables (Spring relaxed binding), the rest of the defaults of its
+      # application.yml already point at the host ports of the compose stack.
+      - name: Start payment-service
+        env:
+          ROOMLOCK_PAYMENT_DECISION_MODE: ${{ inputs.payment_mode }}
+        run: |
+          java -jar payment-service/build/libs/payment-service.jar > payment-service.log 2>&1 &
+          echo "$!" > payment-service.pid
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:8081/actuator/health > /dev/null; then
+              echo "payment-service is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "payment-service did not become healthy in time"
+          cat payment-service.log
+          exit 1
 
       # roomlock.locking.strategy as an environment variable (Spring relaxed binding);
-      # the datasource defaults of application.yml already point at the compose port 5433.
+      # the datasource defaults of application.yml already point at the compose port 5433, and it
+      # reaches the provider the way a run from the IDE does: on the local gRPC port 9091 above.
       - name: Start booking-service
         env:
           ROOMLOCK_LOCKING_STRATEGY: ${{ inputs.strategy }}
@@ -77,27 +121,56 @@ jobs:
           cat booking-service.log
           exit 1
 
-      # All three simulations, sequentially; --all is required because the plugin runs
-      # non-interactively on a runner. An unexpected status fails the task here.
+      # The selected simulations, sequentially; --all is required because the plugin runs
+      # non-interactively on a runner, and a single scenario is picked by its class instead.
+      # An unexpected status fails the task here; the expected 409s do not.
       - name: Run Gatling simulations
         env:
+          SIMULATIONS: ${{ inputs.simulations }}
           STRATEGY: ${{ inputs.strategy }}
+          PAYMENT_MODE: ${{ inputs.payment_mode }}
           USERS: ${{ inputs.users }}
           DURATION: ${{ inputs.duration }}
         run: |
-          ./gradlew :load-tests:gatlingRun --all \
-            --run-description "strategy=$STRATEGY, users=$USERS, duration=${DURATION}s" \
-            "-Droomlock.baseUrl=http://localhost:8080" \
-            "-Droomlock.strategy=$STRATEGY" \
-            "-Droomlock.users=$USERS" \
-            "-Droomlock.duration=$DURATION"
+          case "$SIMULATIONS" in
+            all) selected="" ;;
+            holds) selected="Contention Throughput IdempotentRetry" ;;
+            payments) selected="ConfirmFlow DeclineFlow IdempotentPay" ;;
+            contention) selected="Contention" ;;
+            throughput) selected="Throughput" ;;
+            idempotent-retry) selected="IdempotentRetry" ;;
+            confirm-flow) selected="ConfirmFlow" ;;
+            decline-flow) selected="DeclineFlow" ;;
+            idempotent-pay) selected="IdempotentPay" ;;
+            *) echo "unknown simulation selection: $SIMULATIONS"; exit 1 ;;
+          esac
 
-      - name: Stop booking-service
+          run_gatling() {
+            ./gradlew :load-tests:gatlingRun "$1" \
+              --run-description "strategy=$STRATEGY, payment=$PAYMENT_MODE, users=$USERS, duration=${DURATION}s" \
+              "-Droomlock.baseUrl=http://localhost:8080" \
+              "-Droomlock.strategy=$STRATEGY" \
+              "-Droomlock.paymentMode=$PAYMENT_MODE" \
+              "-Droomlock.users=$USERS" \
+              "-Droomlock.duration=$DURATION"
+          }
+
+          if [ -z "$selected" ]; then
+            run_gatling --all
+          else
+            for simulation in $selected; do
+              run_gatling "--simulation=dev.roomlock.loadtest.${simulation}Simulation"
+            done
+          fi
+
+      - name: Stop the services
         if: always()
         run: |
-          if [ -f booking-service.pid ]; then
-            kill "$(cat booking-service.pid)" || true
-          fi
+          for service in booking-service payment-service; do
+            if [ -f "$service.pid" ]; then
+              kill "$(cat "$service.pid")" || true
+            fi
+          done
 
       # The HTML report of every simulation of this run.
       - name: Upload Gatling reports
@@ -109,11 +182,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload booking-service log
+      - name: Upload service logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: booking-service-log-${{ inputs.strategy }}
-          path: booking-service.log
+          name: service-logs-${{ inputs.strategy }}
+          path: |
+            booking-service.log
+            payment-service.log
           if-no-files-found: ignore
           retention-days: 14
