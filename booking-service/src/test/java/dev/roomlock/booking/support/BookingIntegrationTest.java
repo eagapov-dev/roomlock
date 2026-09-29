@@ -32,7 +32,8 @@ import org.springframework.test.context.ActiveProfiles;
   TestcontainersConfig.class,
   TestClockConfig.class,
   DatabaseCleaner.class,
-  BookingTable.class
+  BookingTable.class,
+  OutboxTable.class
 })
 @ActiveProfiles(Profiles.TEST)
 public @interface BookingIntegrationTest {}
