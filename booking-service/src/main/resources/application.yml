@@ -27,6 +27,11 @@ roomlock:
   hold:
     # A HELD booking keeps the room for this long before it may expire.
     ttl: 10m
+    expiry:
+      # Delay between two sweeps that cancel expired holds; ISO-8601, @Scheduled reads it too.
+      interval: PT30S
+      # Holds one sweep cancels at most.
+      batch-size: 500
   locking:
     # pessimistic | optimistic | constraint (D2)
     strategy: constraint
