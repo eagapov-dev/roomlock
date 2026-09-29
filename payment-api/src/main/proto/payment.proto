@@ -1,0 +1,27 @@
+syntax = "proto3";
+package roomlock.payment.v1;
+
+option java_multiple_files = true;
+option java_package = "dev.roomlock.payment.api.v1";
+
+service PaymentService {
+  rpc Charge(ChargeRequest) returns (ChargeResponse);
+  rpc Refund(RefundRequest) returns (RefundResponse);
+}
+
+message ChargeRequest {
+  string booking_id = 1;   // он же ключ идемпотентности
+  string guest_id = 2;
+  int64 amount_minor = 3;  // сумма в грошах
+  string currency = 4;     // "PLN"
+}
+
+message ChargeResponse {
+  string payment_id = 1;
+  Status status = 2;
+  string decline_reason = 3;
+  enum Status { STATUS_UNSPECIFIED = 0; APPROVED = 1; DECLINED = 2; }
+}
+
+message RefundRequest { string booking_id = 1; }
+message RefundResponse { bool refunded = 1; }  // true и при повторе для уже REFUNDED
