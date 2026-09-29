@@ -13,6 +13,10 @@ spring:
         jdbc:
           time_zone: UTC
   datasource:
+    # Local run against infra/docker-compose (host port 5433); the container overrides SPRING_DATASOURCE_*.
+    url: jdbc:postgresql://localhost:5433/booking
+    username: roomlock
+    password: roomlock
     hikari:
       maximum-pool-size: 10
 
