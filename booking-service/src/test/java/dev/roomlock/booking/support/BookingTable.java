@@ -54,6 +54,14 @@ public class BookingTable {
     return jdbc.queryForObject("SELECT status FROM booking WHERE id = ?", String.class, bookingId);
   }
 
+  /** How many rows the room has, whatever their status. */
+  public int countForRoom(UUID roomId) {
+    Integer count =
+        jdbc.queryForObject(
+            "SELECT count(*) FROM booking WHERE room_id = ?", Integer.class, roomId);
+    return count == null ? 0 : count;
+  }
+
   /** The generated stay column as PostgreSQL prints it, e.g. {@code [2026-11-10,2026-11-13)}. */
   public String stay(UUID bookingId) {
     return jdbc.queryForObject(

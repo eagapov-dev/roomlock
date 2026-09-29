@@ -24,7 +24,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.springframework.test.web.servlet.assertj.MvcTestResult;
 
-@WebMvcTest
+@WebMvcTest(HotelController.class)
 @Import(Problems.class)
 class HotelControllerTest {
 

@@ -6,6 +6,8 @@ import dev.roomlock.booking.domain.CancelReason;
 import dev.roomlock.booking.domain.DateRange;
 import dev.roomlock.booking.domain.Hotel;
 import dev.roomlock.booking.domain.Room;
+import dev.roomlock.booking.hold.HoldAttempt;
+import dev.roomlock.booking.hold.HoldCommand;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
@@ -25,6 +27,7 @@ public final class TestData {
   private static final int STAY_YEAR = 2026;
   private static final String REQUEST_HASH = "a".repeat(64);
   private static final BigDecimal PRICE_PER_NIGHT = new BigDecimal("150.00");
+  private static final BigDecimal TOTAL_PRICE = new BigDecimal("450.00");
 
   private TestData() {}
 
@@ -39,6 +42,17 @@ public final class TestData {
 
   public static RoomDraft aRoom() {
     return new RoomDraft(UUID.randomUUID(), "101", 2, PRICE_PER_NIGHT);
+  }
+
+  /** Hold of 10-13 November by a fresh guest with a fresh idempotency key. */
+  public static HoldDraft aHold() {
+    return new HoldDraft(
+        UUID.randomUUID(), UUID.randomUUID(), november(10), november(13), newIdempotencyKey());
+  }
+
+  /** A key no other request has used. */
+  public static String newIdempotencyKey() {
+    return UUID.randomUUID().toString();
   }
 
   /** HELD booking 10-13 November of a fresh guest with a fresh idempotency key. */
@@ -56,6 +70,46 @@ public final class TestData {
         REQUEST_HASH,
         NOW.plus(HOLD_TTL),
         NOW);
+  }
+
+  public record HoldDraft(
+      UUID roomId, UUID guestId, LocalDate checkIn, LocalDate checkOut, String idempotencyKey) {
+
+    public HoldDraft withRoomId(UUID newRoomId) {
+      return new HoldDraft(newRoomId, guestId, checkIn, checkOut, idempotencyKey);
+    }
+
+    public HoldDraft withGuestId(UUID newGuestId) {
+      return new HoldDraft(roomId, newGuestId, checkIn, checkOut, idempotencyKey);
+    }
+
+    public HoldDraft withStay(LocalDate newCheckIn, LocalDate newCheckOut) {
+      return new HoldDraft(roomId, guestId, newCheckIn, newCheckOut, idempotencyKey);
+    }
+
+    public HoldDraft withIdempotencyKey(String newIdempotencyKey) {
+      return new HoldDraft(roomId, guestId, checkIn, checkOut, newIdempotencyKey);
+    }
+
+    public HoldCommand build() {
+      return new HoldCommand(roomId, guestId, new DateRange(checkIn, checkOut), idempotencyKey);
+    }
+
+    /**
+     * The prepared write a {@link dev.roomlock.booking.hold.HoldStrategy} receives, with the price,
+     * the request hash and the hold window the use case would have computed.
+     */
+    public HoldAttempt attempt() {
+      return new HoldAttempt(
+          roomId,
+          guestId,
+          new DateRange(checkIn, checkOut),
+          TOTAL_PRICE,
+          idempotencyKey,
+          REQUEST_HASH,
+          NOW.plus(HOLD_TTL),
+          NOW);
+    }
   }
 
   public record HotelDraft(String name, String city) {
