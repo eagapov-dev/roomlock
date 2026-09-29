@@ -19,4 +19,5 @@ include(
   "notification-service",
   "payment-api",
   "common",
+  "load-tests",
 )
