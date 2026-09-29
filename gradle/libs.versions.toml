@@ -38,6 +38,9 @@ micrometer-registry-prometheus = { module = "io.micrometer:micrometer-registry-p
 # OpenAPI document and Swagger UI (this release is built against the Spring Boot version above).
 springdoc-openapi-starter-webmvc-ui = { module = "org.springdoc:springdoc-openapi-starter-webmvc-ui", version.ref = "springdoc" }
 
+# Messaging (versions from the Spring Boot BOM)
+spring-kafka = { module = "org.springframework.kafka:spring-kafka" }
+
 # Persistence (versions from the Spring Boot BOM)
 flyway-core = { module = "org.flywaydb:flyway-core" }
 flyway-database-postgresql = { module = "org.flywaydb:flyway-database-postgresql" }
@@ -55,5 +58,6 @@ spring-boot-starter-test = { module = "org.springframework.boot:spring-boot-star
 spring-boot-testcontainers = { module = "org.springframework.boot:spring-boot-testcontainers" }
 testcontainers-junit-jupiter = { module = "org.testcontainers:junit-jupiter" }
 testcontainers-postgresql = { module = "org.testcontainers:postgresql" }
+testcontainers-kafka = { module = "org.testcontainers:kafka" }
 awaitility = { module = "org.awaitility:awaitility" }
 junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher" }
