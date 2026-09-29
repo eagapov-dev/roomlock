@@ -17,6 +17,7 @@ import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
@@ -79,6 +80,17 @@ class ApiExceptionHandler {
   @ExceptionHandler(ResourceNotFoundException.class)
   ProblemDetail onNotFound(ResourceNotFoundException exception) {
     return problems.notFound(exception.resource(), exception.id());
+  }
+
+  /**
+   * The client hung up while the answer was being written - a load generator closing its
+   * connections, a browser tab going away. There is nobody left to answer, so the only thing to do
+   * is to say so at a level nobody pages on: as an unhandled failure it was logged as an error, and
+   * the 500 it produced could not be written either.
+   */
+  @ExceptionHandler(AsyncRequestNotUsableException.class)
+  void onClientGone(AsyncRequestNotUsableException exception) {
+    log.debug("Client went away before the response was written", exception);
   }
 
   @ExceptionHandler(Exception.class)
