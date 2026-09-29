@@ -3,6 +3,7 @@ package dev.roomlock.booking.hold;
 import static dev.roomlock.booking.support.TestData.aHold;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import dev.roomlock.booking.support.NoTransactions;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
@@ -13,11 +14,6 @@ import java.util.Locale;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.springframework.lang.Nullable;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionDefinition;
-import org.springframework.transaction.TransactionStatus;
-import org.springframework.transaction.support.SimpleTransactionStatus;
 
 /**
  * What one hold records, with the attempts scripted instead of raced: a race proves the strategies
@@ -168,25 +164,6 @@ class HoldMetricsTest {
     @Override
     protected HoldOutcome write(HoldAttempt held) {
       return scripted.removeFirst();
-    }
-  }
-
-  /** A strategy opens a transaction per attempt; a scripted attempt has no resource to enlist. */
-  private static final class NoTransactions implements PlatformTransactionManager {
-
-    @Override
-    public TransactionStatus getTransaction(@Nullable TransactionDefinition definition) {
-      return new SimpleTransactionStatus();
-    }
-
-    @Override
-    public void commit(TransactionStatus status) {
-      // nothing was written
-    }
-
-    @Override
-    public void rollback(TransactionStatus status) {
-      // nothing was written
     }
   }
 }

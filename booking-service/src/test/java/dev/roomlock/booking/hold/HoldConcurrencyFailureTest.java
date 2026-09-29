@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
 import dev.roomlock.booking.support.NoTransactions;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.sql.SQLException;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -27,6 +28,7 @@ class HoldConcurrencyFailureTest {
   private static final String DEADLOCK = "40P01";
   private static final String SERIALIZATION_FAILURE = "40001";
 
+  private final HoldMetrics metrics = new HoldMetrics(new SimpleMeterRegistry());
   private final HoldAttempt attempt = aHold().attempt();
 
   @Test
@@ -94,16 +96,16 @@ class HoldConcurrencyFailureTest {
   }
 
   /** A strategy whose attempts answer, or throw, from a script. */
-  private static HoldStrategy scripted(Object... script) {
-    return new ScriptedStrategy(List.of(script));
+  private HoldStrategy scripted(Object... script) {
+    return new ScriptedStrategy(metrics, List.of(script));
   }
 
   private static final class ScriptedStrategy extends TransactionalHoldStrategy {
 
     private final Deque<Object> scripted;
 
-    ScriptedStrategy(List<Object> script) {
-      super(new NoTransactions(), script.size());
+    ScriptedStrategy(HoldMetrics metrics, List<Object> script) {
+      super(new NoTransactions(), metrics, script.size());
       this.scripted = new ArrayDeque<>(script);
     }
 
