@@ -1,5 +1,6 @@
 package dev.roomlock.booking.support;
 
+import dev.roomlock.booking.domain.CancelReason;
 import dev.roomlock.booking.support.TestData.BookingDraft;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -37,7 +38,7 @@ public class BookingTable {
         booking.checkIn(),
         booking.checkOut(),
         booking.status().name(),
-        booking.cancelReason() == null ? null : booking.cancelReason().name(),
+        reasonName(booking.cancelReason()),
         utc(booking.holdExpiresAt()),
         utc(booking.paymentStartedAt()),
         booking.totalPrice(),
@@ -57,6 +58,10 @@ public class BookingTable {
   public String stay(UUID bookingId) {
     return jdbc.queryForObject(
         "SELECT stay::text FROM booking WHERE id = ?", String.class, bookingId);
+  }
+
+  private static @Nullable String reasonName(@Nullable CancelReason reason) {
+    return reason == null ? null : reason.name();
   }
 
   private static @Nullable OffsetDateTime utc(@Nullable Instant instant) {

@@ -50,6 +50,7 @@ public final class TestData {
         november(10),
         november(13),
         BookingStatus.HELD,
+        null,
         new BigDecimal("450.00"),
         UUID.randomUUID().toString(),
         REQUEST_HASH,
@@ -106,6 +107,7 @@ public final class TestData {
       LocalDate checkIn,
       LocalDate checkOut,
       BookingStatus status,
+      @Nullable CancelReason cancelReason,
       BigDecimal totalPrice,
       String idempotencyKey,
       String requestHash,
@@ -120,6 +122,7 @@ public final class TestData {
           checkIn,
           checkOut,
           status,
+          cancelReason,
           totalPrice,
           idempotencyKey,
           requestHash,
@@ -135,6 +138,7 @@ public final class TestData {
           checkIn,
           checkOut,
           status,
+          cancelReason,
           totalPrice,
           idempotencyKey,
           requestHash,
@@ -150,6 +154,7 @@ public final class TestData {
           newCheckIn,
           newCheckOut,
           status,
+          cancelReason,
           totalPrice,
           idempotencyKey,
           requestHash,
@@ -157,6 +162,10 @@ public final class TestData {
           createdAt);
     }
 
+    /**
+     * Changes the status; CANCELLED gets USER_CANCELLED, any other status no reason, as transitions
+     * do.
+     */
     public BookingDraft withStatus(BookingStatus newStatus) {
       return new BookingDraft(
           id,
@@ -165,6 +174,24 @@ public final class TestData {
           checkIn,
           checkOut,
           newStatus,
+          newStatus == BookingStatus.CANCELLED ? CancelReason.USER_CANCELLED : null,
+          totalPrice,
+          idempotencyKey,
+          requestHash,
+          holdExpiresAt,
+          createdAt);
+    }
+
+    /** Overrides the reason alone, to build rows that break the status/reason consistency. */
+    public BookingDraft withCancelReason(@Nullable CancelReason newCancelReason) {
+      return new BookingDraft(
+          id,
+          roomId,
+          guestId,
+          checkIn,
+          checkOut,
+          status,
+          newCancelReason,
           totalPrice,
           idempotencyKey,
           requestHash,
@@ -180,6 +207,7 @@ public final class TestData {
           checkIn,
           checkOut,
           status,
+          cancelReason,
           totalPrice,
           newIdempotencyKey,
           requestHash,
@@ -196,16 +224,12 @@ public final class TestData {
           checkIn,
           checkOut,
           status,
+          cancelReason,
           totalPrice,
           idempotencyKey,
           requestHash,
           holdExpiresAt,
           createdAt);
-    }
-
-    /** Set for CANCELLED rows only, as the lifecycle transitions do. */
-    public @Nullable CancelReason cancelReason() {
-      return status == BookingStatus.CANCELLED ? CancelReason.USER_CANCELLED : null;
     }
 
     /** Set once a booking has entered PAYING, as the lifecycle transitions do. */

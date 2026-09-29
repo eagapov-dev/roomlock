@@ -7,6 +7,8 @@ import static dev.roomlock.booking.support.TestData.november;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
+import dev.roomlock.booking.domain.BookingStatus;
+import dev.roomlock.booking.domain.CancelReason;
 import dev.roomlock.booking.support.BookingJpaTest;
 import dev.roomlock.booking.support.BookingTable;
 import dev.roomlock.booking.support.DatabaseCleaner;
@@ -54,6 +56,32 @@ class BookingSchemaTest {
 
     // when
     Throwable thrown = catchThrowable(() -> bookings.insert(invalid));
+
+    // then
+    assertThat(PostgresErrors.sqlState(thrown)).contains(PostgresErrors.CHECK_VIOLATION);
+  }
+
+  @Test
+  void shouldRejectWithCheckViolationWhenCancelledBookingHasNoReason() {
+    // given
+    BookingDraft cancelledWithoutReason =
+        aBooking().withRoomId(roomId).withStatus(BookingStatus.CANCELLED).withCancelReason(null);
+
+    // when
+    Throwable thrown = catchThrowable(() -> bookings.insert(cancelledWithoutReason));
+
+    // then
+    assertThat(PostgresErrors.sqlState(thrown)).contains(PostgresErrors.CHECK_VIOLATION);
+  }
+
+  @Test
+  void shouldRejectWithCheckViolationWhenActiveBookingHasReason() {
+    // given
+    BookingDraft heldWithReason =
+        aBooking().withRoomId(roomId).withCancelReason(CancelReason.USER_CANCELLED);
+
+    // when
+    Throwable thrown = catchThrowable(() -> bookings.insert(heldWithReason));
 
     // then
     assertThat(PostgresErrors.sqlState(thrown)).contains(PostgresErrors.CHECK_VIOLATION);
