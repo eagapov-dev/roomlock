@@ -31,4 +31,10 @@ class OutboxScheduler {
       log.info("Outbox published {} event(s)", published);
     }
   }
+
+  /** Pruning is housekeeping: it runs on its own, much slower, trigger. */
+  @Scheduled(fixedDelayString = "${roomlock.outbox.retention.interval}")
+  void prune() {
+    publisher.prunePublished();
+  }
 }

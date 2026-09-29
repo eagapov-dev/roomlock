@@ -3,6 +3,8 @@ package dev.roomlock.booking.outbox;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -26,16 +28,28 @@ class OutboxScheduleTest {
   @MockitoBean private OutboxPublisher publisher;
 
   @Test
-  void shouldScheduleSweepWithIntervalOfConfiguration() {
+  void shouldScheduleBothSweepsWithTheIntervalsOfConfiguration() {
     // given
     // when
-    ScheduledTask scheduled = tasks.getScheduledTasks().iterator().next();
+    Map<String, Duration> intervals = intervalsByMethod();
 
-    // then
-    assertThat(tasks.getScheduledTasks()).hasSize(1);
-    Task task = scheduled.getTask();
-    assertThat(task).isInstanceOf(FixedDelayTask.class);
-    assertThat(((FixedDelayTask) task).getIntervalDuration()).isEqualTo(Duration.ofSeconds(1));
+    // then publishing is a hot path and pruning is housekeeping, so they do not share a trigger
+    assertThat(intervals)
+        .containsEntry("publish", Duration.ofSeconds(1))
+        .containsEntry("prune", Duration.ofHours(1))
+        .hasSize(2);
+  }
+
+  /** The delay of each trigger, by the method it fires, as {@code @Scheduled} resolved it. */
+  private Map<String, Duration> intervalsByMethod() {
+    Map<String, Duration> intervals = new HashMap<>();
+    for (ScheduledTask scheduled : tasks.getScheduledTasks()) {
+      Task task = scheduled.getTask();
+      assertThat(task).isInstanceOf(FixedDelayTask.class);
+      String method = task.toString().substring(task.toString().lastIndexOf('.') + 1);
+      intervals.put(method, ((FixedDelayTask) task).getIntervalDuration());
+    }
+    return intervals;
   }
 
   /** Only the trigger and scheduling: no database, no web layer, no auto-configuration. */

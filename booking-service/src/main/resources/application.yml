@@ -56,6 +56,16 @@ roomlock:
     batch-size: 100
     # Refusals after which an event is reported as stuck rather than as a passing outage.
     stuck-after: 10
+    # How long one instance owns the right to publish. It renews on every sweep, so this only has to
+    # outlast a sweep; a dead instance costs one lease period before another takes over.
+    lease: PT30S
+    retention:
+      # Housekeeping, not a hot path.
+      interval: PT1H
+      # Published events stay this long, so yesterday's incident can still be read out of the table.
+      older-than: P7D
+      # Rows one prune deletes at most.
+      batch-size: 1000
   payment:
     # A charge that takes longer than this is given up on; the booking stays PAYING and the sweep
     # below finishes it.

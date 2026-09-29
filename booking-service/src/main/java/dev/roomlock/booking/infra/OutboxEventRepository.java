@@ -43,6 +43,30 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
       nativeQuery = true)
   int markPublished(@Param("eventId") UUID eventId, @Param("publishedAt") Instant publishedAt);
 
+  /**
+   * Deletes up to {@code batchSize} events that went out before {@code before}, oldest first.
+   *
+   * <p>An outbox is a queue, not a history: the event is on the topic, and keeping the row forever
+   * grows the table the unpublished index and the backlog gauge live in.
+   *
+   * @return how many rows were deleted, so a caller can tell a finished sweep from a full batch
+   */
+  @Modifying(clearAutomatically = true)
+  @Transactional
+  @Query(
+      value =
+          """
+          DELETE FROM outbox_event
+          WHERE id IN (
+            SELECT id FROM outbox_event
+            WHERE published_at IS NOT NULL AND published_at < CAST(:before AS timestamptz)
+            ORDER BY published_at
+            LIMIT :batchSize
+          )
+          """,
+      nativeQuery = true)
+  int deletePublishedBefore(@Param("before") Instant before, @Param("batchSize") int batchSize);
+
   /** Counts a publish that failed, so a stuck event can be told from a fresh one (rule DB-5). */
   @Modifying(clearAutomatically = true)
   @Transactional
