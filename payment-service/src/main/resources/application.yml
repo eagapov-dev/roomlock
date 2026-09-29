@@ -90,3 +90,100 @@ roomlock:
     refunds:
       retry:
         backoff: 0s
+
+---
+# Cloud Run deployment (rule SP-9): Cloud SQL over private IP and Google Managed Service for Apache
+# Kafka. Every address and every credential of a real project comes from the environment - nothing
+# below is a literal of one - and docs/deployment.md lists the variables and where each is set.
+spring:
+  config:
+    activate:
+      on-profile: cloud
+  datasource:
+    # Direct VPC egress puts the private IP of the Cloud SQL instance on a route of the revision, so
+    # this is an ordinary host/port JDBC URL: no socket factory, no proxy sidecar, no public IP. A
+    # whole URL in SPRING_DATASOURCE_URL still wins over it, the way the compose stack overrides the
+    # local default above.
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}
+    username: ${DB_USER}
+    # A Secret Manager secret the revision reads as an environment variable; never a literal here.
+    password: ${DB_PASSWORD}
+    hikari:
+      # Per instance, and Cloud Run runs many of them: max-instances x this, plus the pools of the
+      # other two services, has to stay under the connection limit of the Cloud SQL tier - which is
+      # why it is smaller than the 10 of a local run.
+      maximum-pool-size: ${DB_POOL_SIZE:5}
+      # A charge that cannot get a connection is answered rather than waiting for the deadline of
+      # booking-service.
+      connection-timeout: 5s
+      # Cloud SQL maintenance moves the primary: a pool that retires connections notices the move
+      # once instead of handing out a wall of broken ones.
+      max-lifetime: 30m
+  flyway:
+    # Migrations keep running at startup. Flyway locks its history table before it migrates, so of
+    # several instances starting at once exactly one migrates and the rest wait and then find nothing
+    # to do - that lock, not luck, is what makes this safe during a rollout.
+    #
+    # What would change the answer: a migration the previous revision cannot survive (a dropped or
+    # renamed column - both revisions serve traffic while Cloud Run shifts it), or one slow enough to
+    # run into the startup probe and be killed halfway. Either one means migrating in a deliberate
+    # step before the deploy instead of on startup.
+    enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    security:
+      # Managed Service for Apache Kafka accepts nothing else.
+      protocol: ${KAFKA_SECURITY_PROTOCOL:SASL_SSL}
+    properties:
+      # The broker authenticates the service account of the revision over SASL/OAUTHBEARER: the
+      # callback handler asks the metadata server for a token and refreshes it, so there is no
+      # password to leak. The class ships in managed-kafka-auth-login-handler, a runtime dependency
+      # of this service; a deployment that authenticates differently overrides the three variables.
+      sasl.mechanism: ${KAFKA_SASL_MECHANISM:OAUTHBEARER}
+      sasl.jaas.config: ${KAFKA_SASL_JAAS_CONFIG:org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;}
+      sasl.login.callback.handler.class: ${KAFKA_SASL_LOGIN_CALLBACK_HANDLER_CLASS:com.google.cloud.hosted.kafka.auth.GcpLoginCallbackHandler}
+      # The broker is milliseconds away but behind a VPC, a TLS handshake and a token: bound every
+      # call, and reconnect with backoff rather than hammering a broker that is being moved.
+      request.timeout.ms: 10000
+      retry.backoff.ms: 500
+      reconnect.backoff.max.ms: 10000
+    consumer:
+      properties:
+        # A refund is handled inside the poll loop and talks to the database: leave the default five
+        # minutes of max.poll.interval.ms, but let the broker notice an instance that is gone sooner
+        # than that, so a revision Cloud Run stopped does not keep its partitions for a minute.
+        session.timeout.ms: 30000
+        heartbeat.interval.ms: 10000
+  grpc:
+    server:
+      # Cloud Run routes ingress to one port only, and for this service that port is the gRPC one -
+      # the revision declares it h2c, because the contract of payment-api is what another service
+      # calls. PORT is whichever port the revision declared; the 9091 of a local run is the fallback.
+      # The HTTP port below therefore stays inside the instance.
+      port: ${PORT:9091}
+  lifecycle:
+    # Cloud Run sends SIGTERM and then waits: let the charges in flight and the refund being handled
+    # finish first.
+    timeout-per-shutdown-phase: 20s
+
+# The HTTP port is not the ingress port of the revision (see spring.grpc.server.port above): it is
+# reachable on localhost only, which is where the Google Managed Prometheus sidecar scrapes
+# /actuator/prometheus and where the startup and liveness probes of the revision read
+# /actuator/health. Those probes name this port explicitly - their default is the ingress port, and
+# that one speaks gRPC. Nothing outside the instance can curl it: the health of this service is
+# visible through the probe and in Cloud Logging.
+server:
+  port: ${MANAGEMENT_PORT:8081}
+  # A revision being replaced stops taking calls before it stops serving the ones it has.
+  shutdown: graceful
+
+management:
+  endpoint:
+    health:
+      probes:
+        # /actuator/health/liveness and /actuator/health/readiness: Cloud Run is not Kubernetes, so
+        # the groups are not enabled for us. The liveness probe reads the liveness group only, which
+        # is what keeps a database that is briefly away from restarting the instance.
+        enabled: true
+  # The exposure list of the default document already publishes health and prometheus and nothing
+  # else.

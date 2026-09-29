@@ -110,3 +110,113 @@ spring:
       on-profile: no-constraint
   flyway:
     locations: classpath:db/migration
+
+---
+# Cloud Run deployment (rule SP-9): Cloud SQL over private IP, Google Managed Service for Apache
+# Kafka, payment-service behind Cloud Run authentication. Every address and every credential of a
+# real project comes from the environment - nothing below is a literal of one - and docs/deployment.md
+# lists the variables and where each is set.
+spring:
+  config:
+    activate:
+      on-profile: cloud
+  datasource:
+    # Direct VPC egress puts the private IP of the Cloud SQL instance on a route of the revision, so
+    # this is an ordinary host/port JDBC URL: no socket factory, no proxy sidecar, no public IP. A
+    # whole URL in SPRING_DATASOURCE_URL still wins over it, the way the compose stack overrides the
+    # local default above.
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}
+    username: ${DB_USER}
+    # A Secret Manager secret the revision reads as an environment variable; never a literal here.
+    password: ${DB_PASSWORD}
+    hikari:
+      # Per instance, and Cloud Run runs many of them: max-instances x this, plus the pools of the
+      # other two services, has to stay under the connection limit of the Cloud SQL tier - which is
+      # why it is smaller than the 10 of a local run.
+      maximum-pool-size: ${DB_POOL_SIZE:5}
+      # A request that cannot get a connection is answered rather than waiting for the Cloud Run
+      # request timeout.
+      connection-timeout: 5s
+      # Cloud SQL maintenance moves the primary: a pool that retires connections notices the move
+      # once instead of handing out a wall of broken ones.
+      max-lifetime: 30m
+  flyway:
+    # Migrations keep running at startup. Flyway locks its history table before it migrates, so of
+    # several instances starting at once exactly one migrates and the rest wait and then find nothing
+    # to do - that lock, not luck, is what makes this safe during a rollout.
+    #
+    # What would change the answer: a migration the previous revision cannot survive (a dropped or
+    # renamed column - both revisions serve traffic while Cloud Run shifts it), or one slow enough to
+    # run into the startup probe and be killed halfway. Either one means migrating in a deliberate
+    # step before the deploy instead of on startup.
+    enabled: true
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    security:
+      # Managed Service for Apache Kafka accepts nothing else.
+      protocol: ${KAFKA_SECURITY_PROTOCOL:SASL_SSL}
+    properties:
+      # The broker authenticates the service account of the revision over SASL/OAUTHBEARER: the
+      # callback handler asks the metadata server for a token and refreshes it, so there is no
+      # password to leak. The class ships in managed-kafka-auth-login-handler, a runtime dependency
+      # of this service; a deployment that authenticates differently overrides the three variables.
+      sasl.mechanism: ${KAFKA_SASL_MECHANISM:OAUTHBEARER}
+      sasl.jaas.config: ${KAFKA_SASL_JAAS_CONFIG:org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required;}
+      sasl.login.callback.handler.class: ${KAFKA_SASL_LOGIN_CALLBACK_HANDLER_CLASS:com.google.cloud.hosted.kafka.auth.GcpLoginCallbackHandler}
+      # The broker is milliseconds away but behind a VPC, a TLS handshake and a token: bound every
+      # call, and reconnect with backoff rather than hammering a broker that is being moved.
+      request.timeout.ms: 10000
+      retry.backoff.ms: 500
+      reconnect.backoff.max.ms: 10000
+    producer:
+      properties:
+        # The outbox sweep waits 30s for an acknowledgement (KafkaEventSender), so the producer has
+        # to give up first: a broker that is gone then shows up as a failed send whose row the next
+        # sweep publishes again, not as a sweep that ran out of time.
+        delivery.timeout.ms: 20000
+        # Waiting for metadata of a topic is part of that budget, not on top of it.
+        max.block.ms: 10000
+  grpc:
+    client:
+      channels:
+        payment:
+          # The URL of the payment-service revision as a gRPC target on 443, for example
+          # dns:///payment-service-<hash>-<region>.a.run.app:443.
+          address: ${PAYMENT_GRPC_ADDRESS}
+          # Cloud Run terminates TLS at the edge: the hop is https, and the plaintext default of the
+          # local run must not reach this profile.
+          negotiation-type: tls
+  lifecycle:
+    # Cloud Run sends SIGTERM and then waits: let the in-flight requests and the running sweep
+    # finish first.
+    timeout-per-shutdown-phase: 20s
+
+roomlock:
+  cloud:
+    # Audience of the ID token every Charge carries: the base URL of the payment-service revision,
+    # which is what Cloud Run validates the token against (CloudRunAuthInterceptor).
+    payment-audience: ${PAYMENT_AUDIENCE}
+
+# The three sweeps - outbox, hold expiry, payment reconciliation - stay on: they are off only under
+# the `test` profile (SchedulingConfig), and they are what finishes a hold, a charge or an outbox row
+# after a crash. Nothing about them differs here, but they are @Scheduled rather than request-driven,
+# so the revision has to keep its CPU between requests: CPU always allocated and at least one
+# instance (docs/deployment.md). Several instances sweeping at once is safe - every sweep claims its
+# rows with a conditional UPDATE.
+server:
+  # Cloud Run says which port to listen on; the port of a local run stays the fallback.
+  port: ${PORT:8080}
+  # A revision being replaced stops taking requests before it stops serving the ones it has.
+  shutdown: graceful
+
+management:
+  endpoint:
+    health:
+      probes:
+        # /actuator/health/liveness and /actuator/health/readiness: Cloud Run is not Kubernetes, so
+        # the groups are not enabled for us. The liveness probe reads the liveness group only, which
+        # is what keeps a database that is briefly away from restarting the instance.
+        enabled: true
+  # The exposure list of the default document already publishes health and prometheus and nothing
+  # else: /actuator/health for the startup and liveness probes of the revision, /actuator/prometheus
+  # for the Google Managed Prometheus sidecar that scrapes it.

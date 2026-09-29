@@ -14,6 +14,8 @@ dependencies {
   implementation(libs.springdoc.openapi.starter.webmvc.ui)
   implementation(libs.spring.kafka)
   implementation(libs.flyway.core)
+  // The ID token a Charge carries under the `cloud` profile (CloudRunAuthInterceptor).
+  implementation(libs.google.auth.library.oauth2.http)
   // Spring gRPC builds the channel to payment-service from spring.grpc.client.channels. The shaded
   // transport replaces the unshaded one of the starter, so the Netty of the gRPC client is
   // independent of the Netty the Boot BOM manages - the same reason payment-service shades the
@@ -24,6 +26,10 @@ dependencies {
   runtimeOnly(libs.grpc.netty.shaded)
   runtimeOnly(libs.flyway.database.postgresql)
   runtimeOnly(libs.postgresql)
+  // The SASL/OAUTHBEARER callback handler the `cloud` profile names by class: only a managed broker
+  // asks for it, so nothing compiles against it. Its io.confluent transitive lives in the Confluent
+  // repository, which this build does not declare and the handler does not need.
+  runtimeOnly(libs.managed.kafka.auth.login.handler) { exclude(group = "io.confluent") }
 
   testImplementation(libs.spring.boot.testcontainers)
   testImplementation(libs.testcontainers.junit.jupiter)

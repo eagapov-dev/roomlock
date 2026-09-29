@@ -24,6 +24,9 @@ outbox, and both consumers plus the payment provider are idempotent.
   costs, the `no-constraint` profile, and how the metrics and load tests compare them
 - [docs/reliability.md](docs/reliability.md) — idempotent holds, the transactional outbox, idempotent
   consumers, the idempotent charge and refund, and the sweeps that clean up after a crash
+- [docs/deployment.md](docs/deployment.md) — the same architecture on Google Cloud as a one-off
+  demonstration: the `cloud` profile, the images, the deploy workflow, how to verify it against the
+  real thing and how to tear it down again (nothing in it has been run against a real project yet)
 
 ## Running locally
 
