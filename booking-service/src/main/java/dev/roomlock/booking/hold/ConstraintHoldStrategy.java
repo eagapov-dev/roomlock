@@ -17,8 +17,10 @@ class ConstraintHoldStrategy extends TransactionalHoldStrategy {
   private final BookingRepository bookings;
 
   ConstraintHoldStrategy(
-      PlatformTransactionManager transactionManager, BookingRepository bookings) {
-    super(transactionManager, ATTEMPTS);
+      PlatformTransactionManager transactionManager,
+      HoldMetrics metrics,
+      BookingRepository bookings) {
+    super(transactionManager, metrics, ATTEMPTS);
     this.bookings = bookings;
   }
 
