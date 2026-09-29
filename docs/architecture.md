@@ -151,10 +151,10 @@ stateDiagram-v2
   [*] --> HELD : hold accepted
   HELD --> CANCELLED : hold expiry sweep, HOLD_EXPIRED
   HELD --> CANCELLED : guest cancels, USER_CANCELLED
-  HELD --> PAYING : payment started, landing next
-  PAYING --> CONFIRMED : charge approved, landing next
-  PAYING --> CANCELLED : charge declined, PAYMENT_DECLINED, landing next
-  CONFIRMED --> CANCELLED : guest cancels, USER_CANCELLED plus refund, landing next
+  HELD --> PAYING : payment started
+  PAYING --> CONFIRMED : charge approved
+  PAYING --> CANCELLED : charge declined, PAYMENT_DECLINED
+  CONFIRMED --> CANCELLED : guest cancels, USER_CANCELLED plus refund
   CANCELLED --> [*]
 ```
 
@@ -173,10 +173,9 @@ absorbing: no statement in the service updates a cancelled row.
 | `PAYING` | `CANCELLED` | `PAYMENT_DECLINED` | `Charge` declined | conditional `UPDATE ... WHERE status = 'PAYING'` | `BookingCancelled` |
 | `CONFIRMED` | `CANCELLED` | `USER_CANCELLED` | `POST /api/v1/bookings/{id}/cancel` | conditional `UPDATE ... WHERE status = 'CONFIRMED'` | `BookingCancelled` **and** `RefundRequested` |
 
-The last four rows are the payment flow, which is **not in this branch** — see
-[what is here and what is landing next](#what-is-here-and-what-is-landing-next). In this branch a
-booking only ever reaches `CANCELLED` from `HELD`, and `LifecycleService.cancel` answers 409
-`booking-not-cancellable` for a `CONFIRMED` or `PAYING` booking.
+The last four rows are the payment flow — see [the payment flow in code](#the-payment-flow-in-code).
+`LifecycleService.cancel` still answers 409 `booking-not-cancellable` for a `PAYING` booking, because
+a charge is in flight and nothing may cancel a stay whose money is in the air.
 
 The three cancel reasons are `dev.roomlock.booking.domain.CancelReason`; they are mirrored
 name-for-name by `dev.roomlock.contract.v1.CancellationReason` (decision D3), and
@@ -260,28 +259,28 @@ sequenceDiagram
   Note over C,B: a cancel of a CONFIRMED booking also writes RefundRequested,<br/>which payment-service consumes and answers with Refund
 ```
 
-This is the target flow, specified in the branch that is being written in parallel. The pieces of it
-that already exist in this branch are listed below.
+The classes behind each step are listed below.
 
-## What is here and what is landing next
+## The payment flow in code
 
-Everything in this document is in `feat/booking-outbox` **except** the payment flow. What is already
-in place for it:
-
-| Piece | State in this branch |
+| Step | Where it lives |
 | --- | --- |
-| `BookingStatus.PAYING`, `CancelReason.PAYMENT_DECLINED` | present, and allowed by `booking_status_valid` / `booking_cancel_reason_valid` |
-| `booking.payment_started_at` and `booking_status_payment_started_at_idx` | migrated; no application code reads or writes them |
-| `PAYING` counted as holding the room | yes, in `booking_no_overlap` and `existsActiveOverlap` |
-| `BookingConfirmed`, `RefundRequested` contract records | present in `common`, routed to topics by `KafkaEventSender.TOPICS` |
-| `outbox_event_type_valid` | already allows `BookingConfirmed` and `RefundRequested` |
-| payment-service `Charge` / `Refund` | complete, idempotent on the booking id |
-| payment-service `RefundRequested` consumer | complete |
-| `POST /api/v1/bookings/{id}/pay` | **missing** |
-| gRPC client in booking-service | **missing** — `booking-service/build.gradle.kts` already declares `implementation(project(":payment-api"))`, but no source file imports it |
-| `BookingOutbox.recordConfirmed` / `recordRefundRequested` | **missing** — the outbox facade has only `recordHeld` and `recordCancelled` |
-| the PAYING sweep that re-asks `Charge` | **missing** |
-| cancelling a `CONFIRMED` booking | **currently refused** with 409 `booking-not-cancellable`; the target flow turns it into a cancellation plus a `RefundRequested` |
+| `POST /api/v1/bookings/{id}/pay` | `booking-service/src/main/java/dev/roomlock/booking/api/BookingController.java`, answering `PayResult` |
+| the use case, and the outcome the API maps | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentService.java`, `.../payment/PayResult.java` |
+| the three transitions, each a conditional UPDATE | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentTransitions.java` over `BookingRepository.startPaying` / `confirmPaying` / `declinePaying` |
+| the charge as a port, so the flow can be driven without a provider | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentGateway.java`, `.../payment/ChargeOutcome.java` |
+| the gRPC adapter, with a deadline on every call | `booking-service/src/main/java/dev/roomlock/booking/payment/GrpcPaymentGateway.java`, `.../payment/PaymentChannelConfig.java` |
+| the sweep for a booking left in `PAYING` | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentReconciler.java`, `.../payment/PaymentReconcileScheduler.java` (off under the `test` profile) |
+| the events of each ending | `BookingOutbox.recordConfirmed`, `.recordCancelled`, `.recordRefundRequested`, all `MANDATORY` in the transition's transaction |
+| the charge itself | `payment-service`, idempotent on the booking id, and its `RefundRequested` consumer |
+
+Two things about it are worth reading the code for. The charge happens **outside** any database
+transaction — a network round trip inside one would hold a connection of a pool of ten — so the
+transitions before and after it are separate, each conditional on the status it expects. And the
+sweep claims its batch as a *lease*: the CTE picks the oldest stale rows `FOR UPDATE SKIP LOCKED` and
+re-stamps `payment_started_at`, because the charge runs after that transaction commits and a row lock
+would therefore guard nothing between instances. The real guard is that `Charge` is idempotent on the
+booking id, so asking again is free.
 
 ## Events on the wire
 
@@ -400,10 +399,6 @@ are a separate manual workflow (`.github/workflows/load-tests.yml`); see
 
 ## Known gaps
 
-- **The payment flow is absent from this branch.** The table above says exactly which parts exist.
-  In particular `booking-service/build.gradle.kts` depends on `:payment-api` while no source file
-  uses it, and `booking.payment_started_at` plus `booking_status_payment_started_at_idx` are migrated
-  but unread.
 - **`payment-api/src/main/proto/payment.proto` has Russian comments** — the only non-English text in
   the repository.
 - **`Profiles.CLOUD` is declared and never used.** `booking-service` and `payment-service` both

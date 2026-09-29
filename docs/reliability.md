@@ -13,7 +13,7 @@ constraint, a conditional `UPDATE`, or a sweep that finishes what a crash interr
 | Kafka redelivers an event and the guest is told twice | `notification.event_id` unique, claimed before the send | `notification-service/src/main/java/dev/roomlock/notification/notify/NotificationService.java`, `notification-service/src/main/resources/db/migration/V1__create_notification.sql` |
 | Kafka redelivers a refund, or the booking service retries `Charge`, and the guest is charged twice | booking id is the idempotency key of both `Charge` and `Refund` | `payment-service/src/main/java/dev/roomlock/payment/payments/PaymentService.java`, `payment-service/src/main/resources/db/migration/V1__create_payment.sql` |
 | A hold is abandoned and its room is blocked forever | the hold expiry sweep | `booking-service/src/main/java/dev/roomlock/booking/lifecycle/LifecycleService.java` |
-| A `PAYING` booking is left behind by a call that never came back | the PAYING sweep re-asks `Charge` (landing next) | see [the payment flow](#the-payment-flow) |
+| A `PAYING` booking is left behind by a call that never came back | the reconciliation sweep asks `Charge` again, which is idempotent on the booking id | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentReconciler.java` |
 | A record the consumer can never handle blocks its partition | retry with backoff, then the dead-letter topic; unreadable records skip the retries | `payment-service/src/main/java/dev/roomlock/payment/infra/KafkaConsumerConfig.java`, `notification-service/src/main/java/dev/roomlock/notification/infra/KafkaConsumerConfig.java` |
 
 ## Idempotent holds
@@ -326,23 +326,25 @@ Everything the payment side of that story needs is already complete and tested i
   the system stays correct — but the duplication is by accident of the consumers, not by design.
   `expireHolds` is safe under replicas because of `FOR UPDATE SKIP LOCKED`; the outbox has no
   equivalent.
-- **`outbox_event.attempts` is recorded and never acted on.** There is no backoff, no cap and no
-  poison-message path. Combined with "a refused event stops the sweep", one permanently unpublishable
-  event blocks every later event indefinitely — head-of-line blocking of the whole outbox, not just of
-  that booking. The ordering argument justifies the `break`; nothing yet handles the event that never
-  goes out.
+- **A refused event still holds up its own booking, for good.** A refusal now stops that booking
+  alone, and an event refused `roomlock.outbox.stuck-after` times is logged as an error and counted by
+  `roomlock.outbox.stuck` — but it is retried forever and no tool moves it aside. Dropping a committed
+  event is worse than waiting, so the resolution is deliberately a human one; there is no
+  poison-message path and no backoff between sweeps.
 - **Published outbox rows are never deleted or archived.** `outbox_event` grows without bound, and
   `roomlock.outbox.unpublished` runs a `COUNT` on the table on every Prometheus scrape (5s).
 - **notification-service calls the sender inside the database transaction.** That is what makes "a row
   without `sent_at` never committed" true and what makes a failed send roll the claim back, but it
   means a slow or hanging channel holds a Hikari connection for the duration. With the logging adapter
   this is free; with a real e-mail or SMS adapter it would need rethinking.
-- **A concurrent duplicate delivery in notification-service costs retry budget.** The unique violation
-  on `event_id` is not caught; it surfaces as a listener failure, is retried twice by the error
-  handler, and only then does `existsByEventId` see the winner's row and skip. If both retries land
-  before the winner commits, a perfectly ordinary duplicate ends up on the dead-letter topic.
+- **A concurrent duplicate delivery in payment-service is not recognised as one.** notification-service
+  reads the unique violation of its claim as a redelivery (`NotificationDelivery` owns the transaction
+  so the violation can be read after it rolled back); payment-service resolves its own race by reading
+  the stored payment instead, which is correct, but a duplicate that loses the insert race on a
+  *different* constraint would still surface as a listener failure.
 - **Nothing consumes the dead-letter topics.** `<topic>.DLT` is created in tests and written to in
   production, but no service, tool or documented procedure reads them back.
-- **There is no reconciliation between booking-service and payment-service.** A `CONFIRMED` booking
-  whose payment row went missing, or an `APPROVED` payment whose booking never left `PAYING` because
-  the PAYING sweep is not implemented yet, would not be detected by anything.
+- **Reconciliation only runs from booking-service outwards.** The sweep finds a booking stuck in
+  `PAYING` and asks the provider again, so an answer that was lost is recovered. Nothing looks the
+  other way: an `APPROVED` payment whose booking row went missing, or a `CONFIRMED` booking with no
+  payment row, would not be detected.
