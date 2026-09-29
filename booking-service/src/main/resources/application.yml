@@ -24,6 +24,13 @@ spring:
 
 # Booking rules of the service.
 roomlock:
+  outbox:
+    # A sweep publishes what the outbox holds; ISO-8601, as @Scheduled parses it.
+    interval: PT1S
+    # Events one sweep publishes at most.
+    batch-size: 100
+    # The currency every price of this deployment is in; booking rows carry no currency.
+    currency: PLN
   hold:
     # A HELD booking keeps the room for this long before it may expire.
     ttl: 10m

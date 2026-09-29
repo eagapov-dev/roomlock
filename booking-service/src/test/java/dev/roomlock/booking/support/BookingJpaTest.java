@@ -31,7 +31,8 @@ import org.springframework.transaction.annotation.Transactional;
   TestcontainersConfig.class,
   TestClockConfig.class,
   DatabaseCleaner.class,
-  BookingTable.class
+  BookingTable.class,
+  OutboxTable.class
 })
 @ActiveProfiles(Profiles.TEST)
 public @interface BookingJpaTest {}
