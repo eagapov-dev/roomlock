@@ -52,14 +52,12 @@ public interface RoomRepository extends JpaRepository<Room, UUID> {
    * Locks the room row until the transaction ends, so holds of one room run one after another
    * (PESSIMISTIC). Returns empty if the room does not exist.
    */
-  default Optional<UUID> lockById(UUID roomId) {
-    throw new UnsupportedOperationException("Not implemented yet");
-  }
+  @Query(value = "SELECT id FROM room WHERE id = :roomId FOR UPDATE", nativeQuery = true)
+  Optional<UUID> lockById(@Param("roomId") UUID roomId);
 
   /** Current value of the version column, read without a lock (OPTIMISTIC). */
-  default Optional<Long> findVersionById(UUID roomId) {
-    throw new UnsupportedOperationException("Not implemented yet");
-  }
+  @Query(value = "SELECT version FROM room WHERE id = :roomId", nativeQuery = true)
+  Optional<Long> findVersionById(@Param("roomId") UUID roomId);
 
   /**
    * Bumps the version of the room unless another transaction has bumped it first (OPTIMISTIC, rule
@@ -67,7 +65,9 @@ public interface RoomRepository extends JpaRepository<Room, UUID> {
    *
    * @return 1 if this transaction won the room, 0 if it lost the race
    */
-  default int bumpVersion(UUID roomId, long version) {
-    throw new UnsupportedOperationException("Not implemented yet");
-  }
+  @Modifying
+  @Query(
+      value = "UPDATE room SET version = version + 1 WHERE id = :roomId AND version = :version",
+      nativeQuery = true)
+  int bumpVersion(@Param("roomId") UUID roomId, @Param("version") long version);
 }

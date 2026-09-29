@@ -1,5 +1,6 @@
 package dev.roomlock.booking.api;
 
+import dev.roomlock.booking.domain.DateRange;
 import java.net.URI;
 import java.util.List;
 import java.util.UUID;
@@ -44,6 +45,47 @@ final class Problems {
             "Hotel " + hotelId + " already has room " + number);
     problem.setProperty("hotelId", hotelId);
     problem.setProperty("number", number);
+    return problem;
+  }
+
+  ProblemDetail roomBusy(UUID roomId, DateRange stay) {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.CONFLICT,
+            "room-busy",
+            "Room busy",
+            "Room "
+                + roomId
+                + " is booked for a night of "
+                + stay.checkIn()
+                + " - "
+                + stay.checkOut());
+    problem.setProperty("roomId", roomId);
+    problem.setProperty("checkIn", stay.checkIn());
+    problem.setProperty("checkOut", stay.checkOut());
+    return problem;
+  }
+
+  /** Every attempt of the hold lost the room to a concurrent request; retrying may succeed. */
+  ProblemDetail roomContended(UUID roomId) {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.CONFLICT,
+            "room-contended",
+            "Room contended",
+            "Room " + roomId + " is being booked by someone else. Please retry.");
+    problem.setProperty("roomId", roomId);
+    return problem;
+  }
+
+  ProblemDetail idempotencyKeyReused(String idempotencyKey) {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.CONFLICT,
+            "idempotency-key-reused",
+            "Idempotency key reused",
+            "This idempotency key belongs to a different request");
+    problem.setProperty("idempotencyKey", idempotencyKey);
     return problem;
   }
 

@@ -29,6 +29,11 @@ class HoldStrategyConcurrencyTest {
 
   private static final int RACING_HOLDS = 8;
 
+  /**
+   * How often a client retries a hold that lost the race, as the 409 room-contended invites it to.
+   */
+  private static final int CLIENT_RETRIES = 10;
+
   @Autowired private HoldStrategies strategies;
   @Autowired private BookingTable bookings;
   @Autowired private DatabaseCleaner databaseCleaner;
@@ -66,6 +71,11 @@ class HoldStrategyConcurrencyTest {
     assertThat(bookings.countForRoom(roomId)).isEqualTo(1);
   }
 
+  /**
+   * A stay nobody else asked for is never rejected as busy. OPTIMISTIC counts one version per room,
+   * so holds of the same room contend even when their stays do not: such a hold answers
+   * room-contended and is retried, as a client does.
+   */
   @ParameterizedTest
   @EnumSource(LockingStrategy.class)
   void shouldInsertEveryBookingWhenRacingHoldsAskForFreeStays(LockingStrategy strategy) {
@@ -75,11 +85,21 @@ class HoldStrategyConcurrencyTest {
 
     // when
     List<HoldOutcome> outcomes =
-        Concurrently.run(RACING_HOLDS, index -> holds.hold(attempts.get(index)));
+        Concurrently.run(RACING_HOLDS, index -> holdRetryingContention(holds, attempts.get(index)));
 
     // then
     assertThat(outcomes).allMatch(HoldOutcome.Inserted.class::isInstance);
     assertThat(bookings.countForRoom(roomId)).isEqualTo(RACING_HOLDS);
+  }
+
+  private static HoldOutcome holdRetryingContention(HoldStrategy holds, HoldAttempt attempt) {
+    HoldOutcome outcome = holds.hold(attempt);
+    for (int retry = 1;
+        retry <= CLIENT_RETRIES && outcome instanceof HoldOutcome.Contended;
+        retry++) {
+      outcome = holds.hold(attempt);
+    }
+    return outcome;
   }
 
   /** The same room and the same three nights for every attempt, each by its own guest. */
