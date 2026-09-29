@@ -156,20 +156,22 @@ spring:
         heartbeat.interval.ms: 10000
   grpc:
     server:
-      # Cloud Run routes ingress to one port only, and for this service that port is the gRPC one
-      # (declared h2c on the revision): the contract of payment-api is what another service calls.
+      # Cloud Run routes ingress to one port only, and for this service that port is the gRPC one -
+      # the revision declares it h2c, because the contract of payment-api is what another service
+      # calls. PORT is whichever port the revision declared; the 9091 of a local run is the fallback.
       # The HTTP port below therefore stays inside the instance.
-      port: ${PORT:8080}
+      port: ${PORT:9091}
   lifecycle:
     # Cloud Run sends SIGTERM and then waits: let the charges in flight and the refund being handled
     # finish first.
     timeout-per-shutdown-phase: 20s
 
-# The HTTP port is not the ingress port of the revision (see spring.grpc.server.port above): it
-# serves /actuator/prometheus to the Google Managed Prometheus sidecar next to the container, and
-# /actuator/health to nobody else. The startup and liveness probes of the revision are gRPC probes
-# against grpc.health.v1.Health, which spring.grpc.server.health.actuator serves - on by default -
-# from the same health indicators as /actuator/health.
+# The HTTP port is not the ingress port of the revision (see spring.grpc.server.port above): it is
+# reachable on localhost only, which is where the Google Managed Prometheus sidecar scrapes
+# /actuator/prometheus and where the startup and liveness probes of the revision read
+# /actuator/health. Those probes name this port explicitly - their default is the ingress port, and
+# that one speaks gRPC. Nothing outside the instance can curl it: the health of this service is
+# visible through the probe and in Cloud Logging.
 server:
   port: ${MANAGEMENT_PORT:8081}
   # A revision being replaced stops taking calls before it stops serving the ones it has.
