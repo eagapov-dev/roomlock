@@ -17,7 +17,15 @@ import org.junit.jupiter.api.Test;
  */
 class GrpcPaymentGatewayTest {
 
-  private static final Duration DEADLINE = Duration.ofMillis(300);
+  /**
+   * Long enough that a stub answering immediately always wins it, on a cold JVM and a shared CI
+   * runner too: a deadline that expires in a test about reading an answer proves nothing. Only
+   * {@link #shouldReportUnavailableWhenDeadlineExpiresBeforeTheAnswer} wants a short one, and it
+   * faces a server that never answers at all.
+   */
+  private static final Duration DEADLINE = Duration.ofSeconds(5);
+
+  private static final Duration SHORT_DEADLINE = Duration.ofMillis(300);
   private static final String CURRENCY = "PLN";
   private static final long AMOUNT_MINOR = 45_000;
 
@@ -106,7 +114,7 @@ class GrpcPaymentGatewayTest {
     // given
     try (StubPaymentServer provider = StubPaymentServer.answering(new Answer.Hang())) {
       // when
-      ChargeOutcome outcome = gatewayOf(provider).charge(anOrder());
+      ChargeOutcome outcome = gatewayOf(provider, SHORT_DEADLINE).charge(anOrder());
 
       // then
       assertThat(outcome).isEqualTo(new ChargeOutcome.Unavailable("DEADLINE_EXCEEDED"));
@@ -129,7 +137,11 @@ class GrpcPaymentGatewayTest {
   }
 
   private static GrpcPaymentGateway gatewayOf(StubPaymentServer provider) {
-    return new GrpcPaymentGateway(provider.stub(), propertiesWith(DEADLINE));
+    return gatewayOf(provider, DEADLINE);
+  }
+
+  private static GrpcPaymentGateway gatewayOf(StubPaymentServer provider, Duration deadline) {
+    return new GrpcPaymentGateway(provider.stub(), propertiesWith(deadline));
   }
 
   private static PaymentProperties propertiesWith(Duration deadline) {
