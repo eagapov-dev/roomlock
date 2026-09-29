@@ -14,6 +14,7 @@ dependencyResolutionManagement {
 rootProject.name = "roomlock"
 
 include(
+  "booking-service",
   "payment-api",
   "common",
 )
