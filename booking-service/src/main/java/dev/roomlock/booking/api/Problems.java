@@ -79,16 +79,63 @@ final class Problems {
     return problem;
   }
 
-  /** The booking is past the point its guest may drop it: CONFIRMED, or in PAYING. */
+  /**
+   * The booking cannot be dropped right now: it is PAYING, so a charge is in flight and the flow
+   * decides its ending. A CONFIRMED booking is cancellable - it is refunded (rule K-1).
+   */
   ProblemDetail bookingNotCancellable(UUID bookingId, BookingStatus status) {
     ProblemDetail problem =
         problem(
             HttpStatus.CONFLICT,
             "booking-not-cancellable",
             "Booking not cancellable",
-            "Booking " + bookingId + " is " + status + " and can no longer be cancelled");
+            "Booking " + bookingId + " is " + status + " and cannot be cancelled");
     problem.setProperty("bookingId", bookingId);
     problem.setProperty("status", status);
+    return problem;
+  }
+
+  /** The provider refused the charge; the booking is cancelled and the guest keeps the money. */
+  ProblemDetail paymentDeclined(UUID bookingId, String reason) {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.CONFLICT,
+            "payment-declined",
+            "Payment declined",
+            "The payment for booking " + bookingId + " was declined");
+    problem.setProperty("bookingId", bookingId);
+    problem.setProperty("reason", reason);
+    return problem;
+  }
+
+  /** The booking no longer holds a room, so there is nothing left to pay for. */
+  ProblemDetail bookingNotPayable(UUID bookingId, BookingStatus status) {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.CONFLICT,
+            "booking-not-payable",
+            "Booking not payable",
+            "Booking " + bookingId + " is " + status + " and cannot be paid for");
+    problem.setProperty("bookingId", bookingId);
+    problem.setProperty("status", status);
+    return problem;
+  }
+
+  /**
+   * The provider gave no answer, so nothing is known about the money yet. 503 rather than 500: the
+   * booking is still PAYING, the reconciliation sweep finishes it, and the same request sent again
+   * cannot charge twice (rule I-1).
+   */
+  ProblemDetail paymentUnavailable(UUID bookingId) {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.SERVICE_UNAVAILABLE,
+            "payment-unavailable",
+            "Payment unavailable",
+            "The payment for booking "
+                + bookingId
+                + " could not be completed right now. Please retry.");
+    problem.setProperty("bookingId", bookingId);
     return problem;
   }
 

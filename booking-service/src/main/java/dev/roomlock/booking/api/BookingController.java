@@ -7,6 +7,8 @@ import dev.roomlock.booking.hold.HoldResult;
 import dev.roomlock.booking.hold.HoldService;
 import dev.roomlock.booking.lifecycle.CancelResult;
 import dev.roomlock.booking.lifecycle.LifecycleService;
+import dev.roomlock.booking.payment.PayResult;
+import dev.roomlock.booking.payment.PaymentService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -28,12 +30,15 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 
 /**
  * Bookings of a room. The controller only maps HTTP to the use case (rule A-2) and every outcome of
- * {@link HoldResult} and {@link CancelResult} to a status: a replay of the same request answers
- * 200, a first hold 201, and a booking that can no longer be cancelled 409.
+ * {@link HoldResult}, {@link PayResult} and {@link CancelResult} to a status: a replay of the same
+ * request answers 200, a first hold 201, a booking that can no longer be paid for or cancelled 409,
+ * and a payment provider that gave no answer 503.
  */
 @RestController
 @RequestMapping(BookingController.BOOKINGS)
-@Tag(name = "Bookings", description = "Holding a room for a stay and cancelling a booking")
+@Tag(
+    name = "Bookings",
+    description = "Holding a room for a stay, paying for it and cancelling a booking")
 class BookingController {
 
   static final String BOOKINGS = "/api/v1/bookings";
@@ -42,11 +47,14 @@ class BookingController {
   private static final int IDEMPOTENCY_KEY_MAX = 64;
 
   private final HoldService holds;
+  private final PaymentService payments;
   private final LifecycleService lifecycle;
   private final Problems problems;
 
-  BookingController(HoldService holds, LifecycleService lifecycle, Problems problems) {
+  BookingController(
+      HoldService holds, PaymentService payments, LifecycleService lifecycle, Problems problems) {
     this.holds = holds;
+    this.payments = payments;
     this.lifecycle = lifecycle;
     this.problems = problems;
   }
@@ -74,6 +82,27 @@ class BookingController {
           conflict(problems.roomContended(contended.roomId()));
       case HoldResult.IdempotencyKeyReused reused ->
           conflict(problems.idempotencyKeyReused(reused.idempotencyKey()));
+    };
+  }
+
+  /**
+   * No request body: the amount comes from the booking, and payment-service is idempotent on the
+   * booking id, so a client that sends this twice is answered the same way and charged once.
+   */
+  @PostMapping("/{id}/pay")
+  @Operation(summary = "Pay for a booking")
+  ResponseEntity<?> pay(@PathVariable UUID id) {
+    return switch (payments.pay(id)) {
+      case PayResult.Confirmed(Booking booking) -> ResponseEntity.ok(BookingResponse.of(booking));
+      case PayResult.AlreadyConfirmed(Booking booking) ->
+          ResponseEntity.ok(BookingResponse.of(booking));
+      case PayResult.Declined declined ->
+          conflict(problems.paymentDeclined(declined.bookingId(), declined.reason()));
+      case PayResult.NotPayable refused ->
+          conflict(problems.bookingNotPayable(refused.bookingId(), refused.status()));
+      case PayResult.ProviderUnavailable pending ->
+          ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+              .body(problems.paymentUnavailable(pending.bookingId()));
     };
   }
 
