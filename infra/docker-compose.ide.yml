@@ -1,0 +1,17 @@
+# Override: infrastructure in Docker, the three services from the IDE.
+#
+#   docker compose -f infra/docker-compose.yml -f infra/docker-compose.ide.yml up -d
+#
+# The services are moved to the "app" profile, so they do not start unless the profile is
+# requested, and Prometheus scrapes them on the host (application.yml ports 8080/8081/8082).
+services:
+  booking-service:
+    profiles: [app]
+  payment-service:
+    profiles: [app]
+  notification-service:
+    profiles: [app]
+
+  prometheus:
+    volumes:
+      - ./prometheus-ide.yml:/etc/prometheus/prometheus.yml:ro
