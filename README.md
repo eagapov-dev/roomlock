@@ -19,7 +19,7 @@ This starts PostgreSQL 16 (databases `booking`, `payment`, `notification`), Kafk
 
 | Component | Host address |
 | --- | --- |
-| booking-service | http://localhost:8090 (`/actuator/health`, `/actuator/prometheus`) |
+| booking-service | http://localhost:8090 (`/swagger-ui.html`, `/actuator/health`, `/actuator/prometheus`) |
 | payment-service | http://localhost:8091 |
 | notification-service | http://localhost:8092 |
 | PostgreSQL | `localhost:5433`, user `roomlock` / `roomlock` |
