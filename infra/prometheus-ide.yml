@@ -1,0 +1,16 @@
+# Used by docker-compose.ide.yml: the services run from the IDE on the host,
+# on the ports from their application.yml.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: roomlock
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels: { service: booking-service }
+      - targets: ["host.docker.internal:8081"]
+        labels: { service: payment-service }
+      - targets: ["host.docker.internal:8082"]
+        labels: { service: notification-service }

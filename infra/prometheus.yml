@@ -1,0 +1,15 @@
+# Scrapes the three services running inside docker-compose (container ports, not host ports).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: roomlock
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["booking-service:8080"]
+        labels: { service: booking-service }
+      - targets: ["payment-service:8081"]
+        labels: { service: payment-service }
+      - targets: ["notification-service:8082"]
+        labels: { service: notification-service }

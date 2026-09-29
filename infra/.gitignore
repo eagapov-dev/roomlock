@@ -1,0 +1,2 @@
+# The root .gitignore ignores .env.*; the template itself must be tracked.
+!.env.example
