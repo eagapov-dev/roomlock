@@ -28,11 +28,21 @@ final class RoomCatalog {
   private static final LocalDate FIRST_NIGHT = LocalDate.of(2030, 1, 1);
 
   private final int size;
+  private final String pricePerNight;
   private final List<String> roomIds = new CopyOnWriteArrayList<>();
   private final AtomicLong freeStays = new AtomicLong();
 
   RoomCatalog(int size) {
+    this(size, LoadTestSettings.PRICE_PER_NIGHT);
+  }
+
+  /**
+   * The price is a parameter because the total of the stay is what the payment provider decides on:
+   * a pool priced above its threshold is declined, a cheap one is approved.
+   */
+  RoomCatalog(int size, String pricePerNight) {
     this.size = size;
+    this.pricePerNight = pricePerNight;
   }
 
   /**
@@ -40,7 +50,12 @@ final class RoomCatalog {
    * with {@code andThen}, the room ids are only there afterwards.
    */
   ScenarioBuilder warmup() {
-    return scenario("setup: one hotel and " + size + " rooms" + LoadTestSettings.label())
+    return scenario(
+            "setup: one hotel and "
+                + size
+                + " rooms at "
+                + pricePerNight
+                + LoadTestSettings.label())
         .exec(
             http("create hotel")
                 .post("/api/v1/hotels")
@@ -56,7 +71,9 @@ final class RoomCatalog {
                             session ->
                                 "{\"number\":\"L"
                                     + session.getInt("roomIndex")
-                                    + "\",\"capacity\":2,\"pricePerNight\":120.00}"))
+                                    + "\",\"capacity\":2,\"pricePerNight\":"
+                                    + pricePerNight
+                                    + "}"))
                     .check(status().is(201))
                     .check(jsonPath("$.id").saveAs("createdRoomId")))
                 .exec(

@@ -5,6 +5,7 @@ import static io.gatling.javaapi.core.CoreDsl.jsonPath;
 import static io.gatling.javaapi.http.HttpDsl.http;
 import static io.gatling.javaapi.http.HttpDsl.status;
 
+import io.gatling.javaapi.core.Session;
 import io.gatling.javaapi.http.HttpRequestActionBuilder;
 
 /** {@code POST /api/v1/bookings}, built from the feeder attributes of the virtual user. */
@@ -44,5 +45,10 @@ final class Holds {
         .check(status().saveAs(STATUS))
         .check(jsonPath("$.type").optional().saveAs(PROBLEM_TYPE))
         .check(jsonPath("$.id").optional().saveAs(BOOKING_ID));
+  }
+
+  /** True when the hold created a booking, the only case in which paying for it makes sense. */
+  static boolean created(Session session) {
+    return session.contains(STATUS) && session.getInt(STATUS) == 201;
   }
 }
