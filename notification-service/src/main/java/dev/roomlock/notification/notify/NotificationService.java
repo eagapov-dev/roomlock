@@ -1,24 +1,22 @@
 package dev.roomlock.notification.notify;
 
 import dev.roomlock.contract.v1.BookingEvent;
-import dev.roomlock.notification.delivery.NotificationSender;
 import dev.roomlock.notification.domain.GuestNotification;
-import dev.roomlock.notification.domain.Notification;
 import dev.roomlock.notification.infra.NotificationRepository;
-import java.time.Clock;
+import dev.roomlock.notification.infra.SqlState;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 /**
  * Notifies the guest about one booking event, at most once per event.
  *
- * <p>Kafka gives at-least-once delivery, so the event id is the deduplication key: the recorded
- * delivery is claimed and flushed before the sender is called, and the unique {@code event_id}
- * rejects the claim of a duplicate. A send that throws rolls the claim back with it, so the event
- * is still unhandled and its redelivery notifies the guest for real.
+ * <p>Kafka gives at-least-once delivery, so the event id is the deduplication key. A redelivery the
+ * recorded delivery already covers is skipped here; a delivery that loses the race for the claim to
+ * a concurrent consumer is skipped once its transaction has rolled back. Neither is a failure of
+ * this service, and neither may be retried or parked (rule K-3).
  */
 @Service
 public class NotificationService {
@@ -27,22 +25,18 @@ public class NotificationService {
 
   private final NotificationRepository notifications;
   private final NotificationMessages messages;
-  private final NotificationSender sender;
-  private final Clock clock;
+  private final NotificationDelivery delivery;
 
   public NotificationService(
       NotificationRepository notifications,
       NotificationMessages messages,
-      NotificationSender sender,
-      Clock clock) {
+      NotificationDelivery delivery) {
     this.notifications = notifications;
     this.messages = messages;
-    this.sender = sender;
-    this.clock = clock;
+    this.delivery = delivery;
   }
 
-  /** Delivers the notification of the event, or does nothing if the event was already handled. */
-  @Transactional
+  /** Delivers the notification of the event, or does nothing if the event is already handled. */
   public void notifyGuest(BookingEvent event) {
     Optional<GuestNotification> rendered = messages.render(event);
     if (rendered.isEmpty()) {
@@ -57,23 +51,21 @@ public class NotificationService {
           event.bookingId());
       return;
     }
-    GuestNotification message = rendered.get();
-    Notification claim =
-        notifications.saveAndFlush(
-            Notification.claim(
-                event.eventId(),
-                event.type(),
-                message,
-                sender.channel(),
-                event.occurredAt(),
-                clock.instant()));
-    sender.send(message);
-    claim.markSent(clock.instant());
-    log.info(
-        "Notified guest {} about {} of booking {} on {}",
-        message.guestId(),
-        event.type(),
-        event.bookingId(),
-        sender.channel());
+    deliverOnce(event, rendered.get());
+  }
+
+  private void deliverOnce(BookingEvent event, GuestNotification message) {
+    try {
+      delivery.deliver(event, message);
+    } catch (DataIntegrityViolationException violation) {
+      if (!SqlState.UNIQUE_VIOLATION.thrownBy(violation)) {
+        throw violation;
+      }
+      log.info(
+          "Event {} ({} of booking {}) was claimed by another delivery, skipping this one",
+          event.eventId(),
+          event.type(),
+          event.bookingId());
+    }
   }
 }
