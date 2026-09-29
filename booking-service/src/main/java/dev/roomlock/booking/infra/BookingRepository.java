@@ -88,4 +88,121 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
           """,
       nativeQuery = true)
   int cancelHeld(@Param("id") UUID id, @Param("now") Instant now);
+
+  /**
+   * Cancels a booking whose stay was already paid for and answers whether it did (rule DB-5). Split
+   * from {@link #cancelHeld} rather than widened to {@code status IN (...)} because the caller has
+   * to know which of the two happened: only this one owes the guest a {@code RefundRequested}, and
+   * after the UPDATE the old status is gone.
+   */
+  @Modifying(clearAutomatically = true)
+  @Transactional
+  @Query(
+      value =
+          """
+          UPDATE booking
+          SET status = 'CANCELLED',
+              cancel_reason = 'USER_CANCELLED',
+              updated_at = CAST(:now AS timestamptz)
+          WHERE id = :id AND status = 'CONFIRMED'
+          """,
+      nativeQuery = true)
+  int cancelConfirmed(@Param("id") UUID id, @Param("now") Instant now);
+
+  /**
+   * Takes the booking into PAYING and answers whether it did (rule DB-5). {@code
+   * payment_started_at} is stamped by the same statement, so a row is never PAYING without the
+   * moment its charge was started - which is what the reconciliation sweep reads to find a charge
+   * that never came back.
+   */
+  @Modifying(clearAutomatically = true)
+  @Transactional
+  @Query(
+      value =
+          """
+          UPDATE booking
+          SET status = 'PAYING',
+              payment_started_at = CAST(:now AS timestamptz),
+              updated_at = CAST(:now AS timestamptz)
+          WHERE id = :id AND status = 'HELD'
+          """,
+      nativeQuery = true)
+  int startPaying(@Param("id") UUID id, @Param("now") Instant now);
+
+  /**
+   * Confirms a booking whose charge was approved and answers whether it did (rule DB-5). The {@code
+   * status = 'PAYING'} is the transition: a row a concurrent request has already confirmed or
+   * cancelled keeps what it has, so only one caller writes the {@code BookingConfirmed}.
+   */
+  @Modifying(clearAutomatically = true)
+  @Transactional
+  @Query(
+      value =
+          """
+          UPDATE booking
+          SET status = 'CONFIRMED',
+              updated_at = CAST(:now AS timestamptz)
+          WHERE id = :id AND status = 'PAYING'
+          """,
+      nativeQuery = true)
+  int confirmPaying(@Param("id") UUID id, @Param("now") Instant now);
+
+  /**
+   * Cancels a booking whose charge was declined and answers whether it did (rule DB-5). The reason
+   * is the {@code PAYMENT_DECLINED} of the domain, which is also the name the contract uses (D3).
+   */
+  @Modifying(clearAutomatically = true)
+  @Transactional
+  @Query(
+      value =
+          """
+          UPDATE booking
+          SET status = 'CANCELLED',
+              cancel_reason = 'PAYMENT_DECLINED',
+              updated_at = CAST(:now AS timestamptz)
+          WHERE id = :id AND status = 'PAYING'
+          """,
+      nativeQuery = true)
+  int declinePaying(@Param("id") UUID id, @Param("now") Instant now);
+
+  /**
+   * Leases up to {@code batchSize} bookings whose charge never came back, and answers the ones it
+   * took, so the caller can ask the provider again outside a transaction (rule DB-5).
+   *
+   * <p>The CTE picks the batch, driven by {@code booking_status_payment_started_at_idx}, and locks
+   * it: {@code SKIP LOCKED} passes by a row another transaction is writing instead of waiting for
+   * it. A CTE rather than {@code id IN (SELECT ... LIMIT ...)} because PostgreSQL may plan the
+   * subquery as a re-scanned semi-join, which takes more rows than the batch.
+   *
+   * <p>The UPDATE re-stamps {@code payment_started_at}, which is what makes this a lease rather
+   * than a read: the row's age starts again from {@code now}, so no other instance and no later
+   * sweep picks it up until the stale age has passed once more. The lock alone could not do that,
+   * because the charge deliberately happens after this transaction has committed. The conditional
+   * transitions remain the real guard - a charge is idempotent on the booking id, so a sweep that
+   * does race another one asks the same question and loses the UPDATE.
+   */
+  @Transactional
+  @Query(
+      value =
+          """
+          WITH stale AS (
+            SELECT id FROM booking
+            WHERE status = 'PAYING'
+              AND payment_started_at <= CAST(:startedBefore AS timestamptz)
+            ORDER BY payment_started_at
+            LIMIT :batchSize
+            FOR UPDATE SKIP LOCKED
+          )
+          UPDATE booking
+          SET payment_started_at = CAST(:now AS timestamptz),
+              updated_at = CAST(:now AS timestamptz)
+          FROM stale
+          WHERE booking.id = stale.id AND booking.status = 'PAYING'
+          RETURNING booking.id
+          """,
+      nativeQuery = true)
+  List<UUID> leaseStalePayments(
+      @Param("now") Instant now,
+      @Param("startedBefore") Instant startedBefore,
+      @Param("batchSize") int batchSize);
 }

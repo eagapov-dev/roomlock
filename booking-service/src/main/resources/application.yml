@@ -30,16 +30,43 @@ spring:
     password: roomlock
     hikari:
       maximum-pool-size: 10
+  grpc:
+    client:
+      channels:
+        # The roomlock.payment.v1.PaymentService contract of payment-api. Local run against the host
+        # port of infra/docker-compose (9091); inside that network payment-service serves it as
+        # payment-service:9091, which the container sets through
+        # SPRING_GRPC_CLIENT_CHANNELS_PAYMENT_ADDRESS.
+        payment:
+          address: static://localhost:9091
+          # Nothing between the two services terminates TLS, and the gRPC port of payment-service is
+          # plaintext.
+          negotiation-type: plaintext
 
 # Booking rules of the service.
 roomlock:
+  money:
+    # The currency every price of this deployment is in; booking rows carry no currency. Both the
+    # events of the contract and the charge sent to payment-service carry it.
+    currency: PLN
   outbox:
     # A sweep publishes what the outbox holds; ISO-8601, as @Scheduled parses it.
     interval: PT1S
     # Events one sweep publishes at most.
     batch-size: 100
-    # The currency every price of this deployment is in; booking rows carry no currency.
-    currency: PLN
+  payment:
+    # A charge that takes longer than this is given up on; the booking stays PAYING and the sweep
+    # below finishes it.
+    deadline: 3s
+    reconcile:
+      # Delay between two sweeps over bookings whose charge never came back; ISO-8601, @Scheduled
+      # reads it too.
+      interval: PT10S
+      # How long a booking may stay PAYING before a sweep asks the provider again. Well past the
+      # deadline above, so a sweep never races a request that is still waiting for an answer.
+      after: 1m
+      # Bookings one sweep charges at most.
+      batch-size: 100
   hold:
     # A HELD booking keeps the room for this long before it may expire.
     ttl: 10m

@@ -2,9 +2,12 @@ package dev.roomlock.booking.outbox;
 
 import dev.roomlock.booking.domain.Booking;
 import dev.roomlock.booking.domain.CancelReason;
+import dev.roomlock.booking.money.MoneyProperties;
 import dev.roomlock.contract.v1.BookingCancelled;
+import dev.roomlock.contract.v1.BookingConfirmed;
 import dev.roomlock.contract.v1.BookingHeld;
 import dev.roomlock.contract.v1.CancellationReason;
+import dev.roomlock.contract.v1.RefundRequested;
 import java.time.Clock;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
@@ -19,8 +22,8 @@ class BookingEvents {
   private final String currency;
   private final Clock clock;
 
-  BookingEvents(OutboxProperties properties, Clock clock) {
-    this.currency = properties.currency();
+  BookingEvents(MoneyProperties money, Clock clock) {
+    this.currency = money.currency();
     this.clock = clock;
   }
 
@@ -38,6 +41,19 @@ class BookingEvents {
         clock.instant());
   }
 
+  BookingConfirmed confirmed(Booking booking) {
+    return new BookingConfirmed(
+        UUID.randomUUID(),
+        booking.getId(),
+        booking.getRoomId(),
+        booking.getGuestId(),
+        booking.getStay().checkIn(),
+        booking.getStay().checkOut(),
+        booking.getTotalPrice(),
+        currency,
+        clock.instant());
+  }
+
   BookingCancelled cancelled(Booking booking, CancelReason reason) {
     return new BookingCancelled(
         UUID.randomUUID(),
@@ -45,6 +61,20 @@ class BookingEvents {
         booking.getRoomId(),
         booking.getGuestId(),
         reasonOf(reason),
+        clock.instant());
+  }
+
+  /**
+   * The cancelled booking asking for its money back. Written next to the cancellation of a
+   * CONFIRMED booking, never on its own: the refund is what that cancellation owes the guest.
+   */
+  RefundRequested refundRequested(Booking booking) {
+    return new RefundRequested(
+        UUID.randomUUID(),
+        booking.getId(),
+        booking.getGuestId(),
+        booking.getTotalPrice(),
+        currency,
         clock.instant());
   }
 

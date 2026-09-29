@@ -108,19 +108,39 @@ class CancelBookingTest {
     assertThat(reload(bookingId).getCancelReason()).contains(CancelReason.HOLD_EXPIRED);
   }
 
+  /** A paid stay may be dropped now that payment-service refunds it (rule K-1). */
   @Test
-  void shouldRefuseCancelWhenBookingIsConfirmed() {
+  void shouldCancelBookingWhenItWasAlreadyConfirmed() {
     // given
     UUID bookingId =
         bookingTable.insert(aBooking().withRoomId(roomId).withStatus(BookingStatus.CONFIRMED));
+    clock.advance(ONE_MINUTE);
 
     // when
     CancelResult result = lifecycle.cancel(bookingId);
 
     // then
-    assertThat(result)
-        .isEqualTo(new CancelResult.NotCancellable(bookingId, BookingStatus.CONFIRMED));
-    assertThat(bookingTable.status(bookingId)).isEqualTo("CONFIRMED");
+    assertThat(result).isInstanceOf(CancelResult.Cancelled.class);
+    Booking booking = ((CancelResult.Cancelled) result).booking();
+    assertThat(booking.getStatus()).isEqualTo(BookingStatus.CANCELLED);
+    assertThat(booking.getCancelReason()).contains(CancelReason.USER_CANCELLED);
+    assertThat(bookingTable.status(bookingId)).isEqualTo("CANCELLED");
+    assertThat(booking.getUpdatedAt()).isEqualTo(clock.instant());
+  }
+
+  @Test
+  void shouldHoldRoomAgainWhenConfirmedBookingWasCancelled() {
+    // given
+    UUID bookingId =
+        bookingTable.insert(aBooking().withRoomId(roomId).withStatus(BookingStatus.CONFIRMED));
+    lifecycle.cancel(bookingId);
+
+    // when
+    HoldResult result =
+        holds.hold(aHold().withRoomId(roomId).withStay(november(10), november(13)).build());
+
+    // then
+    assertThat(result).isInstanceOf(HoldResult.Held.class);
   }
 
   @Test

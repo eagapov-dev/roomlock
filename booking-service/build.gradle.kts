@@ -1,6 +1,10 @@
 plugins { id("roomlock.spring-boot-service") }
 
 dependencies {
+  // One version for every io.grpc artifact: grpc-java releases its modules together, and the
+  // client starter below would otherwise put an older transport next to the pinned stubs.
+  implementation(platform(libs.grpc.bom))
+
   implementation(project(":payment-api"))
   implementation(project(":common"))
 
@@ -10,6 +14,14 @@ dependencies {
   implementation(libs.springdoc.openapi.starter.webmvc.ui)
   implementation(libs.spring.kafka)
   implementation(libs.flyway.core)
+  // Spring gRPC builds the channel to payment-service from spring.grpc.client.channels. The shaded
+  // transport replaces the unshaded one of the starter, so the Netty of the gRPC client is
+  // independent of the Netty the Boot BOM manages - the same reason payment-service shades the
+  // Netty of its server.
+  implementation(libs.spring.grpc.client.spring.boot.starter) {
+    exclude(group = "io.grpc", module = "grpc-netty")
+  }
+  runtimeOnly(libs.grpc.netty.shaded)
   runtimeOnly(libs.flyway.database.postgresql)
   runtimeOnly(libs.postgresql)
 

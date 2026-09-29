@@ -58,9 +58,10 @@ grpc-protoc-gen-java = { module = "io.grpc:protoc-gen-grpc-java", version.ref = 
 # Transport of the gRPC server: shaded, so its Netty is independent of the one the Boot BOM manages.
 grpc-netty-shaded = { module = "io.grpc:grpc-netty-shaded", version.ref = "grpc" }
 
-# gRPC on Spring Boot: server auto-configuration, and the test module that publishes the port a
-# server started on port 0 ended up with.
+# gRPC on Spring Boot: server auto-configuration, the client channel factory, and the test module
+# that publishes the port a server started on port 0 ended up with.
 spring-grpc-server-spring-boot-starter = { module = "org.springframework.grpc:spring-grpc-server-spring-boot-starter", version.ref = "spring-grpc" }
+spring-grpc-client-spring-boot-starter = { module = "org.springframework.grpc:spring-grpc-client-spring-boot-starter", version.ref = "spring-grpc" }
 spring-grpc-test = { module = "org.springframework.grpc:spring-grpc-test", version.ref = "spring-grpc" }
 
 # Tests (versions from the Spring Boot BOM)

@@ -5,6 +5,7 @@ import dev.roomlock.booking.support.TestData.BookingDraft;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.boot.test.context.TestComponent;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -52,6 +53,28 @@ public class BookingTable {
   /** Raw value of the status column. */
   public String status(UUID bookingId) {
     return jdbc.queryForObject("SELECT status FROM booking WHERE id = ?", String.class, bookingId);
+  }
+
+  /** Raw value of the cancel_reason column, null for a booking that is not cancelled. */
+  public @Nullable String cancelReason(UUID bookingId) {
+    return jdbc.queryForObject(
+        "SELECT cancel_reason FROM booking WHERE id = ?", String.class, bookingId);
+  }
+
+  /** When the charge of the booking was started, empty for a booking that never entered PAYING. */
+  public Optional<Instant> paymentStartedAt(UUID bookingId) {
+    return Optional.ofNullable(
+            jdbc.queryForObject(
+                "SELECT payment_started_at FROM booking WHERE id = ?",
+                OffsetDateTime.class,
+                bookingId))
+        .map(OffsetDateTime::toInstant);
+  }
+
+  /** Sets payment_started_at alone, to age a PAYING row the reconciliation sweep should pick up. */
+  public void setPaymentStartedAt(UUID bookingId, Instant startedAt) {
+    jdbc.update(
+        "UPDATE booking SET payment_started_at = ? WHERE id = ?", utc(startedAt), bookingId);
   }
 
   /** How many rows the room has, whatever their status. */

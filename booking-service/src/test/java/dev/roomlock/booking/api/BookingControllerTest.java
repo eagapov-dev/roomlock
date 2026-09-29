@@ -20,6 +20,8 @@ import dev.roomlock.booking.hold.HoldResult;
 import dev.roomlock.booking.hold.HoldService;
 import dev.roomlock.booking.lifecycle.CancelResult;
 import dev.roomlock.booking.lifecycle.LifecycleService;
+import dev.roomlock.booking.payment.PayResult;
+import dev.roomlock.booking.payment.PaymentService;
 import dev.roomlock.booking.support.TestData.HoldDraft;
 import java.net.URI;
 import java.util.LinkedHashMap;
@@ -46,6 +48,7 @@ class BookingControllerTest {
   @Autowired private MockMvcTester mvc;
   @Autowired private ObjectMapper json;
   @MockitoBean private HoldService holds;
+  @MockitoBean private PaymentService payments;
   @MockitoBean private LifecycleService lifecycle;
 
   @Test
@@ -324,20 +327,19 @@ class BookingControllerTest {
     assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
   }
 
+  /** A paid stay is cancelled rather than refused, so the cancel answers 200 for it too. */
   @Test
-  void shouldReturnConflictWhenBookingIsConfirmed() {
+  void shouldReturnOkWhenConfirmedBookingIsCancelled() {
     // given
-    UUID bookingId = UUID.randomUUID();
-    given(lifecycle.cancel(bookingId))
-        .willReturn(new CancelResult.NotCancellable(bookingId, BookingStatus.CONFIRMED));
+    Booking booking = bookingOf(aHold());
+    given(lifecycle.cancel(booking.getId())).willReturn(new CancelResult.Cancelled(booking));
 
     // when
-    MvcTestResult result = postCancel(bookingId);
+    MvcTestResult result = postCancel(booking.getId());
 
     // then
-    assertProblem(result, HttpStatus.CONFLICT, "booking-not-cancellable");
-    assertThat(result).bodyJson().extractingPath("$.bookingId").isEqualTo(bookingId.toString());
-    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo("CONFIRMED");
+    assertThat(result).hasStatus(HttpStatus.OK);
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
   }
 
   @Test
@@ -369,6 +371,101 @@ class BookingControllerTest {
     assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
     assertThat(result).bodyJson().extractingPath("$.resource").isEqualTo("booking");
     assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(unknownId.toString());
+  }
+
+  @Test
+  void shouldReturnOkWithTheBookingWhenChargeIsApproved() {
+    // given
+    Booking booking = bookingOf(aHold());
+    given(payments.pay(booking.getId())).willReturn(new PayResult.Confirmed(booking));
+
+    // when
+    MvcTestResult result = postPay(booking.getId());
+
+    // then
+    assertThat(result).hasStatus(HttpStatus.OK);
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
+  }
+
+  /** A retried request must not charge again, so an already confirmed booking is 200, not 409. */
+  @Test
+  void shouldReturnOkWhenBookingWasAlreadyConfirmed() {
+    // given
+    Booking booking = bookingOf(aHold());
+    given(payments.pay(booking.getId())).willReturn(new PayResult.AlreadyConfirmed(booking));
+
+    // when
+    MvcTestResult result = postPay(booking.getId());
+
+    // then
+    assertThat(result).hasStatus(HttpStatus.OK);
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
+  }
+
+  @Test
+  void shouldReturnConflictWithTheReasonWhenChargeIsDeclined() {
+    // given
+    UUID bookingId = UUID.randomUUID();
+    given(payments.pay(bookingId))
+        .willReturn(new PayResult.Declined(bookingId, "INSUFFICIENT_FUNDS"));
+
+    // when
+    MvcTestResult result = postPay(bookingId);
+
+    // then
+    assertProblem(result, HttpStatus.CONFLICT, "payment-declined");
+    assertThat(result).bodyJson().extractingPath("$.bookingId").isEqualTo(bookingId.toString());
+    assertThat(result).bodyJson().extractingPath("$.reason").isEqualTo("INSUFFICIENT_FUNDS");
+  }
+
+  @Test
+  void shouldReturnConflictWithTheStatusWhenBookingIsNotPayable() {
+    // given
+    UUID bookingId = UUID.randomUUID();
+    given(payments.pay(bookingId))
+        .willReturn(new PayResult.NotPayable(bookingId, BookingStatus.CANCELLED));
+
+    // when
+    MvcTestResult result = postPay(bookingId);
+
+    // then
+    assertProblem(result, HttpStatus.CONFLICT, "booking-not-payable");
+    assertThat(result).bodyJson().extractingPath("$.bookingId").isEqualTo(bookingId.toString());
+    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo("CANCELLED");
+  }
+
+  /** 503, not 500: the booking stays PAYING and the sweep finishes what this request started. */
+  @Test
+  void shouldReturnServiceUnavailableWhenProviderGaveNoAnswer() {
+    // given
+    UUID bookingId = UUID.randomUUID();
+    given(payments.pay(bookingId)).willReturn(new PayResult.ProviderUnavailable(bookingId));
+
+    // when
+    MvcTestResult result = postPay(bookingId);
+
+    // then
+    assertProblem(result, HttpStatus.SERVICE_UNAVAILABLE, "payment-unavailable");
+    assertThat(result).bodyJson().extractingPath("$.bookingId").isEqualTo(bookingId.toString());
+  }
+
+  @Test
+  void shouldReturnNotFoundWhenBookingOfThePaymentIsUnknown() {
+    // given
+    UUID unknownId = UUID.randomUUID();
+    given(payments.pay(unknownId)).willThrow(new ResourceNotFoundException("booking", unknownId));
+
+    // when
+    MvcTestResult result = postPay(unknownId);
+
+    // then
+    assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
+    assertThat(result).bodyJson().extractingPath("$.resource").isEqualTo("booking");
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(unknownId.toString());
+  }
+
+  private MvcTestResult postPay(UUID bookingId) {
+    return mvc.post().uri(BOOKINGS + "/{id}/pay", bookingId).exchange();
   }
 
   private MvcTestResult postCancel(UUID bookingId) {

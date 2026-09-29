@@ -15,10 +15,13 @@ import dev.roomlock.booking.hold.HoldService;
 import dev.roomlock.booking.infra.HotelRepository;
 import dev.roomlock.booking.infra.RoomRepository;
 import dev.roomlock.booking.lifecycle.LifecycleService;
+import dev.roomlock.booking.payment.PaymentService;
 import dev.roomlock.booking.support.BookingIntegrationTest;
 import dev.roomlock.booking.support.DatabaseCleaner;
 import dev.roomlock.booking.support.MutableClock;
 import dev.roomlock.booking.support.OutboxTable;
+import dev.roomlock.booking.support.StubPaymentGateway;
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
@@ -30,9 +33,13 @@ import org.springframework.beans.factory.annotation.Autowired;
 class CancellationOutboxTest {
 
   private static final String BOOKING_HELD = "BookingHeld";
+  private static final String BOOKING_CONFIRMED = "BookingConfirmed";
   private static final String BOOKING_CANCELLED = "BookingCancelled";
+  private static final String REFUND_REQUESTED = "RefundRequested";
 
   @Autowired private HoldService holds;
+  @Autowired private PaymentService payments;
+  @Autowired private StubPaymentGateway provider;
   @Autowired private LifecycleService lifecycle;
   @Autowired private OutboxTable outbox;
   @Autowired private ObjectMapper json;
@@ -47,6 +54,7 @@ class CancellationOutboxTest {
   void setUp() {
     databaseCleaner.truncateAll();
     clock.setInstant(NOW);
+    provider.reset();
     UUID hotelId = hotels.save(aHotel().build()).getId();
     roomId = rooms.save(aRoom().withHotelId(hotelId).build()).getId();
   }
@@ -60,6 +68,7 @@ class CancellationOutboxTest {
     lifecycle.cancel(booking.getId());
 
     // then
+    // A hold was never paid for, so it asks for no refund.
     assertThat(outbox.typesOf(booking.getId())).containsExactly(BOOKING_HELD, BOOKING_CANCELLED);
     JsonNode event = json.readTree(cancellationPayloadOf(booking.getId()));
     assertThat(event.path("bookingId").asText()).isEqualTo(booking.getId().toString());
@@ -112,6 +121,63 @@ class CancellationOutboxTest {
     assertThat(expired).isEqualTo(2);
     assertThat(outbox.typesOf(first.getId())).containsExactly(BOOKING_HELD, BOOKING_CANCELLED);
     assertThat(outbox.typesOf(second.getId())).containsExactly(BOOKING_HELD, BOOKING_CANCELLED);
+  }
+
+  /**
+   * A paid stay owes the guest the money back, so its cancellation carries a RefundRequested
+   * written in the same transaction (rule K-1). The two share {@code created_at}, since the clock
+   * of a test does not move inside a transaction, so only their presence is asserted here.
+   */
+  @Test
+  void shouldWriteCancellationAndRefundRequestWhenConfirmedBookingIsCancelled() throws Exception {
+    // given
+    Booking booking = held();
+    payments.pay(booking.getId());
+    clock.advance(Duration.ofMinutes(1));
+
+    // when
+    lifecycle.cancel(booking.getId());
+
+    // then
+    assertThat(outbox.typesOf(booking.getId()))
+        .containsExactlyInAnyOrder(
+            BOOKING_HELD, BOOKING_CONFIRMED, BOOKING_CANCELLED, REFUND_REQUESTED);
+    JsonNode refund = json.readTree(outbox.payloadOfLast(booking.getId(), REFUND_REQUESTED));
+    assertThat(refund.path("bookingId").asText()).isEqualTo(booking.getId().toString());
+    assertThat(refund.path("guestId").asText()).isEqualTo(booking.getGuestId().toString());
+    assertThat(refund.path("totalPrice").decimalValue())
+        .isEqualByComparingTo(new BigDecimal("450.00"));
+    assertThat(refund.path("currency").asText()).isEqualTo("PLN");
+    assertThat(refund.path("occurredAt").asText()).isEqualTo(clock.instant().toString());
+  }
+
+  @Test
+  void shouldWriteOneRefundRequestWhenConfirmedBookingIsCancelledTwice() {
+    // given
+    Booking booking = held();
+    payments.pay(booking.getId());
+    lifecycle.cancel(booking.getId());
+
+    // when
+    lifecycle.cancel(booking.getId());
+
+    // then
+    assertThat(outbox.typesOf(booking.getId()))
+        .containsExactlyInAnyOrder(
+            BOOKING_HELD, BOOKING_CONFIRMED, BOOKING_CANCELLED, REFUND_REQUESTED);
+  }
+
+  @Test
+  void shouldWriteNoRefundRequestWhenChargeWasDeclined() {
+    // given
+    Booking booking = held();
+    provider.declineEverything("INSUFFICIENT_FUNDS");
+
+    // when
+    payments.pay(booking.getId());
+
+    // then
+    assertThat(outbox.typesOf(booking.getId())).containsExactly(BOOKING_HELD, BOOKING_CANCELLED);
   }
 
   private Booking held() {

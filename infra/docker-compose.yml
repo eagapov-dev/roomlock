@@ -116,6 +116,9 @@ services:
       <<: *service-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/booking
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # The payment contract is served on gRPC inside this network; the default of application.yml
+      # is the localhost of an IDE run.
+      SPRING_GRPC_CLIENT_CHANNELS_PAYMENT_ADDRESS: static://payment-service:9091
     ports:
       - "${BOOKING_PORT:-8090}:8080"
     depends_on:

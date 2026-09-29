@@ -162,7 +162,7 @@ class OutboxPublisherTest {
     return new OutboxPublisher(
         events,
         broker,
-        new OutboxProperties(Duration.ofSeconds(1), BATCH_SIZE, "PLN"),
+        new OutboxProperties(Duration.ofSeconds(1), BATCH_SIZE),
         clock,
         new OutboxMetrics(registry, events));
   }
