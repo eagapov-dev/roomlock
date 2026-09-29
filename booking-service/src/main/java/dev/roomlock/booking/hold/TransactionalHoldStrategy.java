@@ -16,10 +16,13 @@ import org.springframework.transaction.support.TransactionTemplate;
 abstract class TransactionalHoldStrategy implements HoldStrategy {
 
   private final TransactionTemplate transactions;
+  private final HoldMetrics metrics;
   private final int maxAttempts;
 
-  TransactionalHoldStrategy(PlatformTransactionManager transactionManager, int maxAttempts) {
+  TransactionalHoldStrategy(
+      PlatformTransactionManager transactionManager, HoldMetrics metrics, int maxAttempts) {
     this.transactions = new TransactionTemplate(transactionManager);
+    this.metrics = metrics;
     this.maxAttempts = Math.max(1, maxAttempts);
   }
 

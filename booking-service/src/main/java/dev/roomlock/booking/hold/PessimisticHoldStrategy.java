@@ -20,9 +20,10 @@ class PessimisticHoldStrategy extends TransactionalHoldStrategy {
 
   PessimisticHoldStrategy(
       PlatformTransactionManager transactionManager,
+      HoldMetrics metrics,
       RoomRepository rooms,
       BookingRepository bookings) {
-    super(transactionManager, ATTEMPTS);
+    super(transactionManager, metrics, ATTEMPTS);
     this.rooms = rooms;
     this.bookings = bookings;
   }
