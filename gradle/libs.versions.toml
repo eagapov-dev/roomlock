@@ -11,6 +11,8 @@ jib = "3.5.4"
 protobuf-plugin = "0.10.0"
 protobuf = "4.36.2"
 grpc = "1.84.0"
+# Spring gRPC 0.12.x is the Spring Boot 3.5 line of the project; 1.x is built against Boot 4.
+spring-grpc = "0.12.0"
 gatling-plugin = "3.15.1.3"
 springdoc = "2.9.1"
 
@@ -49,9 +51,17 @@ postgresql = { module = "org.postgresql:postgresql" }
 # Protobuf and gRPC
 protobuf-java = { module = "com.google.protobuf:protobuf-java", version.ref = "protobuf" }
 protobuf-protoc = { module = "com.google.protobuf:protoc", version.ref = "protobuf" }
+grpc-bom = { module = "io.grpc:grpc-bom", version.ref = "grpc" }
 grpc-protobuf = { module = "io.grpc:grpc-protobuf", version.ref = "grpc" }
 grpc-stub = { module = "io.grpc:grpc-stub", version.ref = "grpc" }
 grpc-protoc-gen-java = { module = "io.grpc:protoc-gen-grpc-java", version.ref = "grpc" }
+# Transport of the gRPC server: shaded, so its Netty is independent of the one the Boot BOM manages.
+grpc-netty-shaded = { module = "io.grpc:grpc-netty-shaded", version.ref = "grpc" }
+
+# gRPC on Spring Boot: server auto-configuration, and the test module that publishes the port a
+# server started on port 0 ended up with.
+spring-grpc-server-spring-boot-starter = { module = "org.springframework.grpc:spring-grpc-server-spring-boot-starter", version.ref = "spring-grpc" }
+spring-grpc-test = { module = "org.springframework.grpc:spring-grpc-test", version.ref = "spring-grpc" }
 
 # Tests (versions from the Spring Boot BOM)
 spring-boot-starter-test = { module = "org.springframework.boot:spring-boot-starter-test" }
