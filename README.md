@@ -6,6 +6,25 @@ Hotel room booking backend (Java 21, Spring Boot 3) that compares three locking 
 
 Build (JDK 21, Docker running): `./gradlew spotlessApply build`
 
+## Architecture
+
+Six Gradle modules: booking-service holds rooms and owns the booking lifecycle, payment-service
+charges and refunds over gRPC, notification-service tells the guest what happened, and `common`,
+`payment-api` and `load-tests` carry the Kafka contract, the gRPC contract and the Gatling scenarios.
+Each service owns one PostgreSQL database and they talk to each other only over one gRPC call and two
+Kafka topics. The same hold use case sits behind three interchangeable locking strategies — a
+pessimistic row lock, an optimistic version bump with retries, and a PostgreSQL exclusion constraint —
+and a profile removes the database guard so the application-level ones can be proven rather than
+assumed. Holds are idempotent per guest and key, every event crosses the wire through a transactional
+outbox, and both consumers plus the payment provider are idempotent.
+
+- [docs/architecture.md](docs/architecture.md) — modules, request flow, data ownership, the events and
+  their topics, and the booking lifecycle as a state machine
+- [docs/locking-strategies.md](docs/locking-strategies.md) — the three strategies, what each conflict
+  costs, the `no-constraint` profile, and how the metrics and load tests compare them
+- [docs/reliability.md](docs/reliability.md) — idempotent holds, the transactional outbox, idempotent
+  consumers, the idempotent charge and refund, and the sweeps that clean up after a crash
+
 ## Running locally
 
 Requires JDK 21 and Docker. Build the three service images (Jib, into the local Docker daemon), then start everything with one command:
