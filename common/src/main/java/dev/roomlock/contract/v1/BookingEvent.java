@@ -12,6 +12,9 @@ import java.util.UUID;
 public sealed interface BookingEvent
     permits BookingHeld, BookingConfirmed, BookingCancelled, RefundRequested {
 
+  /** Kafka header the producer puts {@link #type()} in, so a consumer knows what it is reading. */
+  String EVENT_TYPE_HEADER = "event-type";
+
   /** Unique per published event, so a consumer can drop a duplicate delivery. */
   UUID eventId();
 
