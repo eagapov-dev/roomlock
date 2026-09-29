@@ -1,5 +1,6 @@
 package dev.roomlock.booking.api;
 
+import dev.roomlock.booking.domain.BookingStatus;
 import dev.roomlock.booking.domain.DateRange;
 import java.net.URI;
 import java.util.List;
@@ -75,6 +76,19 @@ final class Problems {
             "Room contended",
             "Room " + roomId + " is being booked by someone else. Please retry.");
     problem.setProperty("roomId", roomId);
+    return problem;
+  }
+
+  /** The booking is past the point its guest may drop it: CONFIRMED, or in PAYING. */
+  ProblemDetail bookingNotCancellable(UUID bookingId, BookingStatus status) {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.CONFLICT,
+            "booking-not-cancellable",
+            "Booking not cancellable",
+            "Booking " + bookingId + " is " + status + " and can no longer be cancelled");
+    problem.setProperty("bookingId", bookingId);
+    problem.setProperty("status", status);
     return problem;
   }
 
