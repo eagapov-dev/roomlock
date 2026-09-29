@@ -1,7 +1,7 @@
 {
   "uid": "roomlock",
   "title": "RoomLock",
-  "description": "The hold flow by locking strategy (D2): throughput, p95/p99 of one attempt, the busy and contended outcomes, retried attempts, then the outbox backlog and what it publishes, and below them the HikariCP pool and the JVM of the selected service.",
+  "description": "The hold flow by locking strategy (D2): throughput, p95/p99 of one attempt, the busy and contended outcomes, retried attempts, then the outbox backlog and what it publishes, the charges and refunds of payment-service, and below them the HikariCP pool and the JVM of the selected service.",
   "tags": [
     "roomlock"
   ],
@@ -434,6 +434,201 @@
       ]
     },
     {
+      "id": 17,
+      "type": "row",
+      "title": "Payments",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "panels": []
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Charges per second by outcome",
+      "description": "What payment-service answered. A replay is a repeated charge of a booking it had already decided, and mismatched is a charge refused because the same booking id came back with different money. Pinned to payment-service, which is where the charge lives.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "expr": "sum by (outcome) (rate(roomlock_payment_charges_total{service=\"payment-service\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Refunds per second by outcome",
+      "description": "Refunds, whichever caller asked: the gRPC client or a RefundRequested event of the refund topic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "expr": "sum by (outcome) (rate(roomlock_payment_refunds_total{service=\"payment-service\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Charge latency",
+      "description": "The part of a client's wait that payment-service owns: deciding and recording the charge, without the network.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 27
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(roomlock_payment_charge_duration_seconds_bucket{service=\"payment-service\"}[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "range": true,
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(roomlock_payment_charge_duration_seconds_bucket{service=\"payment-service\"}[1m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
       "id": 6,
       "type": "row",
       "title": "Connection pool",
@@ -442,7 +637,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 35
       },
       "panels": []
     },
@@ -459,7 +654,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 27
+        "y": 36
       },
       "fieldConfig": {
         "defaults": {
@@ -546,7 +741,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 27
+        "y": 36
       },
       "fieldConfig": {
         "defaults": {
@@ -621,7 +816,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 44
       },
       "panels": []
     },
@@ -637,7 +832,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 36
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -690,7 +885,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 36
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -755,7 +950,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 36
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
@@ -819,7 +1014,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 36
+        "y": 45
       },
       "fieldConfig": {
         "defaults": {
