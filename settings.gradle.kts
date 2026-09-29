@@ -15,6 +15,7 @@ rootProject.name = "roomlock"
 
 include(
   "booking-service",
+  "payment-service",
   "payment-api",
   "common",
 )
