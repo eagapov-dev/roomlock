@@ -6,6 +6,8 @@ dependencies {
 
   implementation(libs.spring.boot.starter.web)
   implementation(libs.spring.boot.starter.data.jpa)
+  implementation(libs.spring.boot.starter.validation)
+  implementation(libs.springdoc.openapi.starter.webmvc.ui)
   implementation(libs.flyway.core)
   runtimeOnly(libs.flyway.database.postgresql)
   runtimeOnly(libs.postgresql)
