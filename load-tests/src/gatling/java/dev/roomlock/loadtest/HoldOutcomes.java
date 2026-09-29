@@ -3,9 +3,6 @@ package dev.roomlock.loadtest;
 import static io.gatling.javaapi.core.CoreDsl.exec;
 
 import io.gatling.javaapi.core.ChainBuilder;
-import java.util.Map;
-import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.atomic.LongAdder;
 
 /**
  * Counts how a run's holds ended, one counter per HTTP status and per problem type. The 409s of a
@@ -14,9 +11,7 @@ import java.util.concurrent.atomic.LongAdder;
  */
 final class HoldOutcomes {
 
-  private static final String PROBLEM_PREFIX = "urn:roomlock:problem:";
-
-  private final Map<String, LongAdder> counts = new ConcurrentSkipListMap<>();
+  private final OutcomeTally tally = new OutcomeTally();
 
   /** Reads the status and problem type the hold saved in the session and counts the outcome. */
   ChainBuilder record() {
@@ -28,46 +23,25 @@ final class HoldOutcomes {
   }
 
   void count(String outcome) {
-    counts.computeIfAbsent(outcome, key -> new LongAdder()).increment();
+    tally.count(outcome);
   }
 
   long total() {
-    return counts.values().stream().mapToLong(LongAdder::sum).sum();
+    return tally.total();
   }
 
   /** The block printed after the run, next to the path of the Gatling report. */
   String report(String simulation) {
-    StringBuilder text =
-        new StringBuilder("hold outcomes of ")
-            .append(simulation)
-            .append(" (strategy=")
-            .append(LoadTestSettings.STRATEGY)
-            .append("):");
-    counts.forEach(
-        (outcome, count) ->
-            text.append(System.lineSeparator())
-                .append("  ")
-                .append(outcome)
-                .append(" = ")
-                .append(count.sum()));
-    return text.append(System.lineSeparator()).append("  total = ").append(total()).toString();
+    return tally.report(
+        "hold outcomes of " + simulation + " (strategy=" + LoadTestSettings.STRATEGY + ")");
   }
 
   private static String outcome(int status, String problemType) {
     return switch (status) {
       case 201 -> "201 created";
       case 200 -> "200 replayed";
-      case 409 -> "409 " + problemName(problemType);
+      case 409 -> "409 " + OutcomeTally.problemName(problemType);
       default -> status + " unexpected";
     };
-  }
-
-  private static String problemName(String problemType) {
-    if (problemType == null) {
-      return "conflict without a problem type";
-    }
-    return problemType.startsWith(PROBLEM_PREFIX)
-        ? problemType.substring(PROBLEM_PREFIX.length())
-        : problemType;
   }
 }

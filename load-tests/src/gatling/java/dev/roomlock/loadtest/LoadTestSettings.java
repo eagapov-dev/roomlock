@@ -3,6 +3,8 @@ package dev.roomlock.loadtest;
 import static io.gatling.javaapi.http.HttpDsl.http;
 
 import io.gatling.javaapi.http.HttpProtocolBuilder;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Duration;
 
 /**
@@ -11,7 +13,8 @@ import java.time.Duration;
  *
  * <p>{@code strategy} is only a label: the locking strategy is chosen by the service itself ({@code
  * roomlock.locking.strategy}), the load test just carries the name into its output so runs of
- * different strategies can be told apart.
+ * different strategies can be told apart. {@code paymentMode} is a label of the same kind, for the
+ * decision mode of the payment provider behind the confirm flow.
  */
 final class LoadTestSettings {
 
@@ -30,6 +33,24 @@ final class LoadTestSettings {
   /** Rooms created by the setup phase; the throughput phase spreads its holds over them. */
   static final int ROOMS = intProperty("roomlock.rooms", 20);
 
+  /** Price per night of the rooms the setup phase creates; a one-night stay costs exactly this. */
+  static final String PRICE_PER_NIGHT = decimalProperty("roomlock.pricePerNight", "120.00");
+
+  /**
+   * Price per night of the decline flow: above the limit of the payment provider in {@code
+   * THRESHOLD} mode ({@code roomlock.payment.decision.decline-above-minor}, 1000.00 PLN by
+   * default), so a one-night stay is declined on purpose and the provider needs no reconfiguration.
+   */
+  static final String DECLINED_PRICE_PER_NIGHT =
+      decimalProperty("roomlock.declinedPricePerNight", "2500.00");
+
+  /**
+   * Label of the decision mode the payment provider under test runs with: {@code APPROVE_ALL},
+   * {@code DECLINE_ALL} or {@code THRESHOLD}. Like {@link #STRATEGY} it only reaches the output,
+   * the provider is configured by its own deployment ({@code roomlock.payment.decision.mode}).
+   */
+  static final String PAYMENT_MODE = property("roomlock.paymentMode", "THRESHOLD");
+
   private LoadTestSettings() {}
 
   /** JSON in, JSON (or problem+json) out, one connection pool per virtual user. */
@@ -42,7 +63,14 @@ final class LoadTestSettings {
 
   /** Suffix of every scenario name, so the report says which run it belongs to. */
   static String label() {
-    return " [strategy=" + STRATEGY + ", users=" + USERS + ", rooms=" + ROOMS + "]";
+    return label("");
+  }
+
+  /**
+   * The same suffix for a scenario that pays: the mode of the provider decides what it may expect.
+   */
+  static String paymentLabel() {
+    return label(", payment=" + PAYMENT_MODE);
   }
 
   /** One banner line per run, printed before the injection starts. */
@@ -62,6 +90,15 @@ final class LoadTestSettings {
         + "s";
   }
 
+  /** The same banner for a scenario that pays. */
+  static String paymentBanner(String simulation) {
+    return banner(simulation) + ", payment mode=" + PAYMENT_MODE;
+  }
+
+  private static String label(String extra) {
+    return " [strategy=" + STRATEGY + ", users=" + USERS + ", rooms=" + ROOMS + extra + "]";
+  }
+
   private static String property(String name, String fallback) {
     String value = System.getProperty(name);
     return value == null || value.isBlank() ? fallback : value.trim();
@@ -77,5 +114,14 @@ final class LoadTestSettings {
       throw new IllegalArgumentException(name + " must be positive, got " + parsed);
     }
     return parsed;
+  }
+
+  /** An amount of money, in the two decimals the booking API answers prices with. */
+  private static String decimalProperty(String name, String fallback) {
+    BigDecimal parsed = new BigDecimal(property(name, fallback));
+    if (parsed.signum() < 1) {
+      throw new IllegalArgumentException(name + " must be positive, got " + parsed);
+    }
+    return parsed.setScale(2, RoundingMode.HALF_UP).toPlainString();
   }
 }
