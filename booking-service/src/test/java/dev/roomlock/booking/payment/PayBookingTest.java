@@ -170,6 +170,23 @@ class PayBookingTest {
   }
 
   @Test
+  void shouldRefusePaymentWhenConfirmedBookingWasCancelledAfterwards() {
+    // given
+    Booking booking = held();
+    payments.pay(booking.getId());
+    lifecycle.cancel(booking.getId());
+    provider.reset();
+
+    // when
+    PayResult result = payments.pay(booking.getId());
+
+    // then
+    assertThat(result)
+        .isEqualTo(new PayResult.NotPayable(booking.getId(), BookingStatus.CANCELLED));
+    assertThat(provider.received()).isEmpty();
+  }
+
+  @Test
   void shouldRefusePaymentWhenAnEarlierChargeWasDeclined() {
     // given
     Booking booking = held();

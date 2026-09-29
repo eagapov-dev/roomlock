@@ -327,20 +327,19 @@ class BookingControllerTest {
     assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
   }
 
+  /** A paid stay is cancelled rather than refused, so the cancel answers 200 for it too. */
   @Test
-  void shouldReturnConflictWhenBookingIsConfirmed() {
+  void shouldReturnOkWhenConfirmedBookingIsCancelled() {
     // given
-    UUID bookingId = UUID.randomUUID();
-    given(lifecycle.cancel(bookingId))
-        .willReturn(new CancelResult.NotCancellable(bookingId, BookingStatus.CONFIRMED));
+    Booking booking = bookingOf(aHold());
+    given(lifecycle.cancel(booking.getId())).willReturn(new CancelResult.Cancelled(booking));
 
     // when
-    MvcTestResult result = postCancel(bookingId);
+    MvcTestResult result = postCancel(booking.getId());
 
     // then
-    assertProblem(result, HttpStatus.CONFLICT, "booking-not-cancellable");
-    assertThat(result).bodyJson().extractingPath("$.bookingId").isEqualTo(bookingId.toString());
-    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo("CONFIRMED");
+    assertThat(result).hasStatus(HttpStatus.OK);
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
   }
 
   @Test

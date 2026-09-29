@@ -13,9 +13,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Booking lifecycle use cases that need no payment provider: hold expiry and guest cancellation.
- * Both transitions are conditional native UPDATEs of the repository, never a write through the
- * entity (rule DB-5), and both stamp {@code updated_at} from the injected clock (rule SP-12).
+ * Booking lifecycle use cases that need no call to the payment provider: hold expiry and guest
+ * cancellation. Every transition is a conditional native UPDATE of the repository, never a write
+ * through the entity (rule DB-5), and each stamps {@code updated_at} from the injected clock (rule
+ * SP-12). A cancelled stay that had been paid for asks for its money back with an event rather than
+ * a call, so payment-service can be down while a guest cancels (rule K-1).
  */
 @Service
 public class LifecycleService {
@@ -53,18 +55,32 @@ public class LifecycleService {
   /**
    * Cancels the booking on behalf of its guest. The conditional UPDATE decides the outcome: it
    * either wins, or the row is read back to say why it did not (rule J-2).
+   *
+   * <p>Two UPDATEs rather than one that matches both statuses, because the two endings owe the
+   * guest different things and the old status is gone once the row is written: a HELD booking only
+   * loses its room, a CONFIRMED one was paid for and gets a {@code RefundRequested} next to its
+   * cancellation, in the same transaction (rule K-1). A PAYING booking is refused either way - a
+   * charge is in flight and only the payment flow may decide how it ends.
    */
   @Transactional
   public CancelResult cancel(UUID bookingId) {
-    if (bookings.cancelHeld(bookingId, clock.instant()) > 0) {
+    Instant now = clock.instant();
+    if (bookings.cancelHeld(bookingId, now) > 0) {
       Booking cancelled = get(bookingId);
       outbox.recordCancelled(cancelled, CancelReason.USER_CANCELLED);
+      return new CancelResult.Cancelled(cancelled);
+    }
+    if (bookings.cancelConfirmed(bookingId, now) > 0) {
+      Booking cancelled = get(bookingId);
+      outbox.recordCancelled(cancelled, CancelReason.USER_CANCELLED);
+      outbox.recordRefundRequested(cancelled);
       return new CancelResult.Cancelled(cancelled);
     }
     Booking booking = get(bookingId);
     return switch (booking.getStatus()) {
       case CANCELLED -> new CancelResult.AlreadyCancelled(booking);
-      // HELD cannot reach this branch: the UPDATE waits for a concurrent writer and then matches.
+      // HELD and CONFIRMED cannot reach this branch: their UPDATE waits for a concurrent writer and
+      // then matches.
       case HELD, PAYING, CONFIRMED ->
           new CancelResult.NotCancellable(bookingId, booking.getStatus());
     };

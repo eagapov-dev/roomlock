@@ -13,6 +13,7 @@ import dev.roomlock.booking.domain.BookingStatus;
 import dev.roomlock.booking.support.BookingIntegrationTest;
 import dev.roomlock.booking.support.BookingTable;
 import dev.roomlock.booking.support.DatabaseCleaner;
+import dev.roomlock.booking.support.OutboxTable;
 import dev.roomlock.booking.support.TestData.HoldDraft;
 import dev.roomlock.booking.support.TestData.RoomDraft;
 import java.util.LinkedHashMap;
@@ -40,6 +41,7 @@ class BookingCancelApiIntegrationTest {
   @Autowired private TestRestTemplate rest;
   @Autowired private ObjectMapper json;
   @Autowired private BookingTable bookingTable;
+  @Autowired private OutboxTable outbox;
   @Autowired private DatabaseCleaner databaseCleaner;
 
   private UUID roomId;
@@ -83,8 +85,9 @@ class BookingCancelApiIntegrationTest {
     assertThat(json.readTree(retry.getBody()).path("status").asText()).isEqualTo("CANCELLED");
   }
 
+  /** A paid stay may be dropped, and asks payment-service for the money back (rule K-1). */
   @Test
-  void shouldReturnConflictWhenBookingIsConfirmed() throws Exception {
+  void shouldReportCancelledBookingWhenConfirmedStayIsDropped() throws Exception {
     // given
     UUID bookingId =
         bookingTable.insert(
@@ -97,6 +100,28 @@ class BookingCancelApiIntegrationTest {
     ResponseEntity<String> response = cancel(bookingId);
 
     // then
+    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+    JsonNode booking = json.readTree(response.getBody());
+    assertThat(booking.path("status").asText()).isEqualTo("CANCELLED");
+    assertThat(booking.path("cancelReason").asText()).isEqualTo("USER_CANCELLED");
+    assertThat(outbox.typesOf(bookingId)).contains("RefundRequested");
+  }
+
+  /** A charge is in flight: only the payment flow may decide how a PAYING booking ends. */
+  @Test
+  void shouldReturnConflictWhenBookingIsPaying() throws Exception {
+    // given
+    UUID bookingId =
+        bookingTable.insert(
+            aBooking()
+                .withRoomId(roomId)
+                .withStay(november(10), november(13))
+                .withStatus(BookingStatus.PAYING));
+
+    // when
+    ResponseEntity<String> response = cancel(bookingId);
+
+    // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
     assertThat(response.getHeaders().getContentType())
         .isEqualTo(MediaType.APPLICATION_PROBLEM_JSON);
@@ -104,8 +129,8 @@ class BookingCancelApiIntegrationTest {
     assertThat(problem.path("type").asText())
         .isEqualTo("urn:roomlock:problem:booking-not-cancellable");
     assertThat(problem.path("bookingId").asText()).isEqualTo(bookingId.toString());
-    assertThat(problem.path("status").asText()).isEqualTo("CONFIRMED");
-    assertThat(bookingTable.status(bookingId)).isEqualTo("CONFIRMED");
+    assertThat(problem.path("status").asText()).isEqualTo("PAYING");
+    assertThat(bookingTable.status(bookingId)).isEqualTo("PAYING");
   }
 
   @Test
