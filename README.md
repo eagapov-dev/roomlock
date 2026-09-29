@@ -20,7 +20,7 @@ This starts PostgreSQL 16 (databases `booking`, `payment`, `notification`), Kafk
 | Component | Host address |
 | --- | --- |
 | booking-service | http://localhost:8090 (`/swagger-ui.html`, `/actuator/health`, `/actuator/prometheus`) |
-| payment-service | http://localhost:8091 |
+| payment-service | http://localhost:8091, gRPC `localhost:9091` (`roomlock.payment.v1.PaymentService`) |
 | notification-service | http://localhost:8092 |
 | PostgreSQL | `localhost:5433`, user `roomlock` / `roomlock` |
 | Kafka | `localhost:9094` (inside compose: `kafka:9092`) |

@@ -138,10 +138,16 @@ services:
     environment:
       <<: *service-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     ports:
       - "${PAYMENT_PORT:-8091}:8081"
+      # The payment contract is served on gRPC, next to the HTTP port: booking-service reaches it
+      # inside this network as payment-service:9091, this mapping is for grpcurl from the host.
+      - "${PAYMENT_GRPC_PORT:-9091}:9091"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8081/actuator/health"]
