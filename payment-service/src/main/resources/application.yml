@@ -4,6 +4,66 @@ spring:
   threads:
     virtual:
       enabled: true
+  flyway:
+    locations: classpath:db/migration
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  datasource:
+    # Local run against infra/docker-compose (host port 5433); the container overrides SPRING_DATASOURCE_*.
+    url: jdbc:postgresql://localhost:5433/payment
+    username: roomlock
+    password: roomlock
+    hikari:
+      maximum-pool-size: 10
+  kafka:
+    # Local run against the EXTERNAL listener of infra/docker-compose; the container overrides
+    # SPRING_KAFKA_BOOTSTRAP_SERVERS with kafka:9092 (INTERNAL).
+    bootstrap-servers: localhost:9094
+    consumer:
+      group-id: payment-service
+      # A new deployment reads the whole topic: the payment row, not the offset, is what keeps a
+      # booking from being refunded twice.
+      auto-offset-reset: earliest
+      # The container commits, and only after the handler returned.
+      enable-auto-commit: false
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # The type is in the event-type header, so the payload stays raw JSON until RefundEventReader
+      # knows which record of the contract to read it as.
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      # Only the dead-letter publisher produces, and it forwards the record as it arrived.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    listener:
+      ack-mode: record
+  grpc:
+    server:
+      # The contract of payment-api is served next to the HTTP port below, not on it.
+      port: 9091
+
+# Payment settings of the service (PaymentProperties, RefundProperties).
+roomlock:
+  payment:
+    # The stubbed acquirer: deterministic, so a load test can drive either outcome on purpose.
+    decision:
+      # APPROVE_ALL, DECLINE_ALL or THRESHOLD (decline above the amount below).
+      mode: THRESHOLD
+      # 1000.00 PLN in grosze: a charge of more than this is declined.
+      decline-above-minor: 100000
+    refunds:
+      # Topics.REFUND_REQUESTS of the contract.
+      topic: roomlock.refund-requests.v1
+      # Where a record the consumer cannot handle is parked, next to the topic it came from.
+      dead-letter-suffix: .DLT
+      retry:
+        attempts: 2
+        backoff: 1s
 
 server:
   port: 8081
@@ -13,3 +73,20 @@ management:
     web:
       exposure:
         include: health, prometheus
+
+---
+# Tests: Testcontainers infrastructure, a gRPC server on a free port, and no waiting between
+# retries (rule T-7).
+spring:
+  config:
+    activate:
+      on-profile: test
+  grpc:
+    server:
+      port: 0
+
+roomlock:
+  payment:
+    refunds:
+      retry:
+        backoff: 0s
