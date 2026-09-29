@@ -2,6 +2,9 @@ package dev.roomlock.booking.hold;
 
 import dev.roomlock.booking.infra.SqlState;
 import java.util.Objects;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.dao.ConcurrencyFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -14,6 +17,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * translated after the rollback, never inside the transaction that broke.
  */
 abstract class TransactionalHoldStrategy implements HoldStrategy {
+
+  private static final Logger log = LoggerFactory.getLogger(TransactionalHoldStrategy.class);
 
   private final TransactionTemplate transactions;
   private final int maxAttempts;
@@ -43,6 +48,13 @@ abstract class TransactionalHoldStrategy implements HoldStrategy {
       return Objects.requireNonNull(transactions.execute(status -> write(attempt)));
     } catch (DataIntegrityViolationException violation) {
       return outcomeOf(violation);
+    } catch (ConcurrencyFailureException lostRace) {
+      // A deadlock (40P01) or a serialization failure (40001): the database, not the application,
+      // picked this attempt as the loser - which PostgreSQL does while several inserts wait on
+      // booking_no_overlap. It is the same lost race as a lost version bump, so it is answered the
+      // same way instead of failing the request.
+      log.debug("Attempt of {} lost a race inside the database", strategy(), lostRace);
+      return new HoldOutcome.Contended();
     }
   }
 
