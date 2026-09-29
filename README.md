@@ -37,7 +37,7 @@ Stop and delete all data: `docker compose -f infra/docker-compose.yml down -v`.
 
 ## Load tests
 
-Gatling scenarios in `load-tests/src/gatling/java` put the same contention on the booking API, so the three locking strategies can be compared on throughput, latency and conflict rates. Against the running compose stack:
+Gatling scenarios in `load-tests/src/gatling/java` put the same contention on the booking API, so the three locking strategies can be compared on throughput, latency and conflict rates — while holding a room, and while paying for it. Against the running compose stack:
 
 ```bash
 ./gradlew :load-tests:gatlingRun --all
@@ -48,8 +48,19 @@ Gatling scenarios in `load-tests/src/gatling/java` put the same contention on th
 | `ContentionSimulation` | every virtual user holds the same room for the same night; exactly one 201, the rest 409 `room-busy` / `room-contended` |
 | `ThroughputSimulation` | holds spread over the room pool and over nights that never overlap: the mostly conflict-free path |
 | `IdempotentRetrySimulation` | the same hold twice with one `Idempotency-Key`; the replay has to answer 200 with the same booking id |
+| `ConfirmFlowSimulation` | the whole funnel: hold a room, pay for it, read the booking back as `CONFIRMED` |
+| `DeclineFlowSimulation` | the same funnel with a charge that is declined: 409 `payment-declined` and the booking read back as `CANCELLED` |
+| `IdempotentPaySimulation` | the same booking paid twice; both answers 200 with the same booking id and status `CONFIRMED`, so nobody is charged twice |
 
-Each run creates its own hotel and rooms over HTTP, so nothing is expected in the database. The expected 409s are counted per problem type and printed after the run; a run only fails on an unexpected status. One simulation at a time: `--simulation=dev.roomlock.loadtest.ContentionSimulation` instead of `--all`.
+Each run creates its own hotel and rooms over HTTP, so nothing is expected in the database. The expected 409s are counted per problem type and printed after the run — holds and charges in a tally of their own — and a run only fails on an unexpected status: a 5xx that is not the documented 503 `payment-unavailable`, or a 400. One simulation at a time: `--simulation=dev.roomlock.loadtest.ContentionSimulation` instead of `--all`.
+
+The three confirm-flow scenarios pay over `POST /api/v1/bookings/{id}/pay`, so payment-service has to be up as well (it is part of the compose stack). Its decision is deterministic: `roomlock.payment.decision.mode` is `THRESHOLD` (decline above `decline-above-minor`, 1000.00 PLN by default), `APPROVE_ALL` or `DECLINE_ALL`. `DeclineFlowSimulation` therefore needs no reconfiguration — it prices its rooms at `roomlock.declinedPricePerNight` (2500.00), above the threshold, and the charge is declined on the amount alone. To force a decline in every scenario instead, run the provider in `DECLINE_ALL` and tell the load test which mode to expect:
+
+```bash
+ROOMLOCK_PAYMENT_DECISION_MODE=DECLINE_ALL ./gradlew :payment-service:bootRun
+./gradlew :load-tests:gatlingRun --simulation=dev.roomlock.loadtest.DeclineFlowSimulation \
+  -Droomlock.paymentMode=DECLINE_ALL
+```
 
 Run parameters are system properties of the Gradle invocation:
 
@@ -58,14 +69,18 @@ Run parameters are system properties of the Gradle invocation:
 | `roomlock.baseUrl` | `http://localhost:8090` | booking-service under test |
 | `roomlock.strategy` | `unknown` | label of the strategy, reaches the scenario names and the output |
 | `roomlock.users` | `50` | virtual users of the load phase |
-| `roomlock.duration` | `30` | seconds the throughput scenario keeps its users busy |
+| `roomlock.duration` | `30` | seconds the throughput and confirm-flow scenarios keep their users busy |
 | `roomlock.rooms` | `20` | rooms the setup phase creates |
+| `roomlock.pricePerNight` | `120.00` | price of those rooms, and so the total a one-night stay is charged |
+| `roomlock.declinedPricePerNight` | `2500.00` | the same for the decline flow: above the threshold of the provider |
+| `roomlock.paymentMode` | `THRESHOLD` | label of the decision mode the provider runs with, reaches the names and the output |
 
 The strategy itself is chosen by the service, not by the load test: `roomlock.locking.strategy` is `pessimistic`, `optimistic` or `constraint` (`constraint` by default). The compose file has no hook for it, so run booking-service next to the stack (infrastructure only, service on port 8080) and pass the strategy as an environment variable:
 
 ```bash
 docker compose -f infra/docker-compose.yml -f infra/docker-compose.ide.yml up -d
 ROOMLOCK_LOCKING_STRATEGY=optimistic ./gradlew :booking-service:bootRun
+./gradlew :payment-service:bootRun  # the confirm-flow scenarios charge against it
 ./gradlew :load-tests:gatlingRun --all --run-description "strategy=optimistic" \
   -Droomlock.baseUrl=http://localhost:8080 -Droomlock.strategy=optimistic \
   -Droomlock.users=100 -Droomlock.duration=60
@@ -73,4 +88,4 @@ ROOMLOCK_LOCKING_STRATEGY=optimistic ./gradlew :booking-service:bootRun
 
 `SPRING_APPLICATION_JSON='{"roomlock":{"locking":{"strategy":"optimistic"}}}'` does the same.
 
-The HTML report of every run lands in `load-tests/build/reports/gatling/<simulation>-<timestamp>/index.html`. In CI the scenarios are a manual job: **Actions → Load tests → Run workflow**, with the strategy, the user count and the duration as inputs; it never runs on a pull request and uploads the reports as artifacts.
+The HTML report of every run lands in `load-tests/build/reports/gatling/<simulation>-<timestamp>/index.html`. In CI the scenarios are a manual job: **Actions → Load tests → Run workflow**, with the strategy, the simulations of the run (all, the three hold scenarios, the three confirm-flow ones, or a single one), the payment decision mode, the user count and the duration as inputs; it starts booking-service and payment-service from their boot jars next to the infrastructure, never runs on a pull request, and uploads the reports and the service logs as artifacts.
