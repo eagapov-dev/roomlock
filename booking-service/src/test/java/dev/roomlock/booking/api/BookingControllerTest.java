@@ -12,11 +12,14 @@ import static org.mockito.BDDMockito.then;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.roomlock.booking.domain.Booking;
+import dev.roomlock.booking.domain.BookingStatus;
 import dev.roomlock.booking.domain.DateRange;
 import dev.roomlock.booking.domain.ResourceNotFoundException;
 import dev.roomlock.booking.hold.HoldCommand;
 import dev.roomlock.booking.hold.HoldResult;
 import dev.roomlock.booking.hold.HoldService;
+import dev.roomlock.booking.lifecycle.CancelResult;
+import dev.roomlock.booking.lifecycle.LifecycleService;
 import dev.roomlock.booking.support.TestData.HoldDraft;
 import java.net.URI;
 import java.util.LinkedHashMap;
@@ -43,6 +46,7 @@ class BookingControllerTest {
   @Autowired private MockMvcTester mvc;
   @Autowired private ObjectMapper json;
   @MockitoBean private HoldService holds;
+  @MockitoBean private LifecycleService lifecycle;
 
   @Test
   void shouldReturnCreatedWithLocationWhenRoomIsHeld() throws Exception {
@@ -290,6 +294,85 @@ class BookingControllerTest {
     // then
     assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
     assertThat(result).bodyJson().extractingPath("$.resource").isEqualTo("booking");
+  }
+
+  @Test
+  void shouldReturnOkWhenBookingIsCancelled() {
+    // given
+    Booking booking = bookingOf(aHold());
+    given(lifecycle.cancel(booking.getId())).willReturn(new CancelResult.Cancelled(booking));
+
+    // when
+    MvcTestResult result = postCancel(booking.getId());
+
+    // then
+    assertThat(result).hasStatus(HttpStatus.OK);
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
+  }
+
+  @Test
+  void shouldReturnOkWhenBookingIsAlreadyCancelled() {
+    // given
+    Booking booking = bookingOf(aHold());
+    given(lifecycle.cancel(booking.getId())).willReturn(new CancelResult.AlreadyCancelled(booking));
+
+    // when
+    MvcTestResult result = postCancel(booking.getId());
+
+    // then
+    assertThat(result).hasStatus(HttpStatus.OK);
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(booking.getId().toString());
+  }
+
+  @Test
+  void shouldReturnConflictWhenBookingIsConfirmed() {
+    // given
+    UUID bookingId = UUID.randomUUID();
+    given(lifecycle.cancel(bookingId))
+        .willReturn(new CancelResult.NotCancellable(bookingId, BookingStatus.CONFIRMED));
+
+    // when
+    MvcTestResult result = postCancel(bookingId);
+
+    // then
+    assertProblem(result, HttpStatus.CONFLICT, "booking-not-cancellable");
+    assertThat(result).bodyJson().extractingPath("$.bookingId").isEqualTo(bookingId.toString());
+    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo("CONFIRMED");
+  }
+
+  @Test
+  void shouldReturnConflictWhenBookingIsPaying() {
+    // given
+    UUID bookingId = UUID.randomUUID();
+    given(lifecycle.cancel(bookingId))
+        .willReturn(new CancelResult.NotCancellable(bookingId, BookingStatus.PAYING));
+
+    // when
+    MvcTestResult result = postCancel(bookingId);
+
+    // then
+    assertProblem(result, HttpStatus.CONFLICT, "booking-not-cancellable");
+    assertThat(result).bodyJson().extractingPath("$.status").isEqualTo("PAYING");
+  }
+
+  @Test
+  void shouldReturnNotFoundWhenBookingOfTheCancelIsUnknown() {
+    // given
+    UUID unknownId = UUID.randomUUID();
+    given(lifecycle.cancel(unknownId))
+        .willThrow(new ResourceNotFoundException("booking", unknownId));
+
+    // when
+    MvcTestResult result = postCancel(unknownId);
+
+    // then
+    assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
+    assertThat(result).bodyJson().extractingPath("$.resource").isEqualTo("booking");
+    assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(unknownId.toString());
+  }
+
+  private MvcTestResult postCancel(UUID bookingId) {
+    return mvc.post().uri(BOOKINGS + "/{id}/cancel", bookingId).exchange();
   }
 
   private static Booking bookingOf(HoldDraft draft) {
