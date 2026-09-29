@@ -1,0 +1,20 @@
+# Load tests are never part of the regular CI run: they are slow and shared runners
+# give noisy numbers. Started manually only.
+name: Load tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  load-tests:
+    name: Gatling load tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Placeholder: Gatling scenarios arrive on day 5, then this job gets
+      # checkout, JDK 21, docker compose up and ./gradlew :load-tests:gatlingRun.
+      - name: Placeholder
+        run: echo "Load tests are not implemented yet (planned for day 5)."
