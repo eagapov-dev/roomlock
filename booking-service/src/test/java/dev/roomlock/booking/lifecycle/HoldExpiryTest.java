@@ -23,6 +23,7 @@ import dev.roomlock.booking.support.DatabaseCleaner;
 import dev.roomlock.booking.support.MutableClock;
 import java.time.Duration;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -145,12 +146,12 @@ class HoldExpiryTest {
     clock.advance(HOLD_TTL.plus(ONE_SECOND));
 
     // when
-    int cancelled = bookings.expireHolds(clock.instant(), 1);
+    List<UUID> cancelled = bookings.expireHolds(clock.instant(), 1);
 
     // then
-    assertThat(cancelled).isEqualTo(1);
-    assertThat(bookings.expireHolds(clock.instant(), 1)).isEqualTo(1);
-    assertThat(bookings.expireHolds(clock.instant(), 1)).isZero();
+    assertThat(cancelled).hasSize(1);
+    assertThat(bookings.expireHolds(clock.instant(), 1)).hasSize(1);
+    assertThat(bookings.expireHolds(clock.instant(), 1)).isEmpty();
   }
 
   @Test

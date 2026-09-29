@@ -3,6 +3,7 @@ package dev.roomlock.booking.infra;
 import dev.roomlock.booking.domain.Booking;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -37,16 +38,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
       @Param("checkOut") LocalDate checkOut);
 
   /**
-   * Cancels up to {@code batchSize} holds whose window has ended, and answers how many were
-   * cancelled (rule DB-5). The CTE picks the batch, driven by {@code
-   * booking_status_hold_expires_at_idx}, and locks it: {@code SKIP LOCKED} passes by a row another
-   * transaction is writing instead of waiting for it, and the next sweep picks that one up. A CTE
-   * rather than {@code id IN (SELECT ... LIMIT ...)} because PostgreSQL may plan the subquery as a
-   * re-scanned semi-join, which cancels more rows than the batch. The {@code status = 'HELD'} of
-   * the UPDATE is the transition itself: a booking a concurrent request has confirmed or cancelled
-   * keeps what it has.
+   * Cancels up to {@code batchSize} holds whose window has ended, and answers the bookings it
+   * cancelled, so the caller can record an event for each of them (rule DB-5). The CTE picks the
+   * batch, driven by {@code booking_status_hold_expires_at_idx}, and locks it: {@code SKIP LOCKED}
+   * passes by a row another transaction is writing instead of waiting for it, and the next sweep
+   * picks that one up. A CTE rather than {@code id IN (SELECT ... LIMIT ...)} because PostgreSQL
+   * may plan the subquery as a re-scanned semi-join, which cancels more rows than the batch. The
+   * {@code status = 'HELD'} of the UPDATE is the transition itself: a booking a concurrent request
+   * has confirmed or cancelled keeps what it has.
    */
-  @Modifying(clearAutomatically = true)
   @Transactional
   @Query(
       value =
@@ -65,9 +65,10 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
               updated_at = CAST(:now AS timestamptz)
           FROM expired
           WHERE booking.id = expired.id AND booking.status = 'HELD'
+          RETURNING booking.id
           """,
       nativeQuery = true)
-  int expireHolds(@Param("now") Instant now, @Param("batchSize") int batchSize);
+  List<UUID> expireHolds(@Param("now") Instant now, @Param("batchSize") int batchSize);
 
   /**
    * Cancels the booking on behalf of its guest and answers whether it did (rule DB-5). Only a HELD

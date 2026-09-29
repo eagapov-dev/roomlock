@@ -1,6 +1,8 @@
 package dev.roomlock.booking.hold;
 
+import dev.roomlock.booking.domain.Booking;
 import dev.roomlock.booking.infra.BookingRepository;
+import dev.roomlock.booking.outbox.BookingOutbox;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 
@@ -15,13 +17,16 @@ class ConstraintHoldStrategy extends TransactionalHoldStrategy {
   private static final int ATTEMPTS = 1;
 
   private final BookingRepository bookings;
+  private final BookingOutbox outbox;
 
   ConstraintHoldStrategy(
       PlatformTransactionManager transactionManager,
       HoldMetrics metrics,
-      BookingRepository bookings) {
+      BookingRepository bookings,
+      BookingOutbox outbox) {
     super(transactionManager, metrics, ATTEMPTS);
     this.bookings = bookings;
+    this.outbox = outbox;
   }
 
   @Override
@@ -31,6 +36,8 @@ class ConstraintHoldStrategy extends TransactionalHoldStrategy {
 
   @Override
   protected HoldOutcome write(HoldAttempt attempt) {
-    return new HoldOutcome.Inserted(bookings.saveAndFlush(attempt.newBooking()));
+    Booking booking = bookings.saveAndFlush(attempt.newBooking());
+    outbox.recordHeld(booking);
+    return new HoldOutcome.Inserted(booking);
   }
 }

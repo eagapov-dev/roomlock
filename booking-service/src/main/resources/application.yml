@@ -14,6 +14,15 @@ spring:
       hibernate:
         jdbc:
           time_zone: UTC
+  kafka:
+    # Local run against the EXTERNAL listener of infra/docker-compose; the container overrides
+    # SPRING_KAFKA_BOOTSTRAP_SERVERS with kafka:9092 (INTERNAL).
+    bootstrap-servers: localhost:9094
+    producer:
+      # The outbox may only mark a row published once every replica has the record.
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
   datasource:
     # Local run against infra/docker-compose (host port 5433); the container overrides SPRING_DATASOURCE_*.
     url: jdbc:postgresql://localhost:5433/booking
@@ -24,6 +33,13 @@ spring:
 
 # Booking rules of the service.
 roomlock:
+  outbox:
+    # A sweep publishes what the outbox holds; ISO-8601, as @Scheduled parses it.
+    interval: PT1S
+    # Events one sweep publishes at most.
+    batch-size: 100
+    # The currency every price of this deployment is in; booking rows carry no currency.
+    currency: PLN
   hold:
     # A HELD booking keeps the room for this long before it may expire.
     ttl: 10m
