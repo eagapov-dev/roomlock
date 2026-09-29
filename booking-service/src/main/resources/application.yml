@@ -22,6 +22,17 @@ spring:
     hikari:
       maximum-pool-size: 10
 
+# Booking rules of the service.
+roomlock:
+  hold:
+    # A HELD booking keeps the room for this long before it may expire.
+    ttl: 10m
+  locking:
+    # pessimistic | optimistic | constraint (D2)
+    strategy: constraint
+    # Attempts of a strategy that retries a lost race (optimistic).
+    max-attempts: 3
+
 server:
   port: 8080
 

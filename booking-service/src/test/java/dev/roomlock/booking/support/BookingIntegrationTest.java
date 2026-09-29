@@ -21,6 +21,11 @@ import org.springframework.test.context.ActiveProfiles;
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@Import({TestcontainersConfig.class, TestClockConfig.class, DatabaseCleaner.class})
+@Import({
+  TestcontainersConfig.class,
+  TestClockConfig.class,
+  DatabaseCleaner.class,
+  BookingTable.class
+})
 @ActiveProfiles(Profiles.TEST)
 public @interface BookingIntegrationTest {}
