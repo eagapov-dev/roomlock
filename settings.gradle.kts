@@ -12,3 +12,7 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "roomlock"
+
+include(
+  "payment-api",
+)
