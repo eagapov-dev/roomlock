@@ -1,0 +1,172 @@
+# Deploys the three services to Cloud Run: builds the images with Jib, pushes them into Artifact
+# Registry and rolls each service onto the new one, failing the run if a revision never becomes
+# healthy. docs/deployment.md is the prose version of this file.
+#
+# Manual only, and never on a tag. A tag says which commit but never which project, and everything
+# this deploy is pointed at - the pool, the service account, the region, the registry - comes from the
+# variables of a GitHub environment, so "which environment" is exactly the question a tag cannot
+# answer. The commit SHA is the image tag either way, so asking a human to pick the target costs
+# nothing and keeps a push from moving what serves real bookings.
+#
+# This workflow never runs OpenTofu or Terraform. What lives in infra/gcp is changed in a separate,
+# deliberate step by a human (docs/deployment.md): a deploy that could also move a database or a Kafka
+# cluster is not one anybody can undo by pointing at the previous revision.
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment whose variables name the project, region and registry to deploy to
+        type: environment
+        required: true
+
+permissions:
+  contents: read
+  # Workload Identity Federation: the job trades this OIDC token for a short-lived Google one, which
+  # is why no key of a service account exists anywhere in this repository.
+  id-token: write
+
+concurrency:
+  # Two deploys of one environment would race over which revision ends up serving.
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build, push and roll out (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The variables and secrets below are the ones of this environment.
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Nothing about the target is hardcoded here; the OpenTofu of infra/gcp creates what these name.
+      # Fail on a missing one now rather than half way through a rollout.
+      - name: Check the variables of the environment
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_ARTIFACT_REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          missing=""
+          for name in GCP_PROJECT_ID GCP_REGION GCP_ARTIFACT_REPOSITORY \
+            GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT; do
+            if [ -z "${!name}" ]; then
+              missing="$missing $name"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "The variables of this environment are missing:$missing"
+            exit 1
+          fi
+
+      # The Gradle toolchain requires Java 21 and auto-provisioning is disabled.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Gradle cache + wrapper checksum validation.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      # Activates those credentials for the gcloud of the runner; the rollout below is gcloud.
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      # One Jib build per service, straight into Artifact Registry: no local daemon and no
+      # `docker login` with a password - the registry is given the access token of the federated
+      # identity, which lives for an hour. linux/amd64 because Cloud Run runs amd64 whatever the
+      # runner is, and the commit SHA as the only tag (see roomlock.spring-boot-service.gradle.kts).
+      - name: Build and push the images
+        env:
+          IMAGE_REPOSITORY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_ARTIFACT_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+          JIB_TO_USERNAME: oauth2accesstoken
+        run: |
+          JIB_TO_PASSWORD="$(gcloud auth print-access-token)"
+          export JIB_TO_PASSWORD
+          ./gradlew jib \
+            "-Pimage.repository=$IMAGE_REPOSITORY" \
+            "-Pimage.tag=$IMAGE_TAG" \
+            -Djib.from.platforms=linux/amd64
+
+      # `gcloud run services update` waits for the new revision and already exits non-zero if it never
+      # becomes ready. The check after it is the loud part: the run only passes if the revision that
+      # serves traffic is the one this deploy created, so a rollout that silently kept the old one is
+      # a failure and not a green tick.
+      - name: Roll out the revisions
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          IMAGE_REPOSITORY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_ARTIFACT_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          describe() {
+            gcloud run services describe "$1" \
+              --project "$GCP_PROJECT_ID" --region "$GCP_REGION" --format "$2"
+          }
+
+          # payment-service first: booking-service charges against it, and a booking that reaches a
+          # provider of the previous revision is only a charge that is asked for again.
+          for service in payment-service notification-service booking-service; do
+            echo "::group::$service"
+
+            gcloud run services update "$service" \
+              --project "$GCP_PROJECT_ID" \
+              --region "$GCP_REGION" \
+              --image "$IMAGE_REPOSITORY/$service:$IMAGE_TAG"
+
+            created="$(describe "$service" 'value(status.latestCreatedRevisionName)')"
+            ready="$(describe "$service" 'value(status.latestReadyRevisionName)')"
+            if [ "$created" != "$ready" ]; then
+              echo "$service: revision $created never became ready (serving: ${ready:-none})"
+              describe "$service" 'yaml(status.conditions)'
+              exit 1
+            fi
+            echo "$service: $ready is serving"
+
+            echo "::endgroup::"
+          done
+
+      # The URLs the verification of docs/deployment.md is run against.
+      - name: Report the revisions
+        if: success()
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "### Deployed \`$IMAGE_TAG\` to \`$GCP_PROJECT_ID\` (\`$GCP_REGION\`)"
+            echo
+            echo "| Service | Revision | URL |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          for service in booking-service payment-service notification-service; do
+            revision="$(gcloud run services describe "$service" \
+              --project "$GCP_PROJECT_ID" --region "$GCP_REGION" \
+              --format 'value(status.latestReadyRevisionName)')"
+            url="$(gcloud run services describe "$service" \
+              --project "$GCP_PROJECT_ID" --region "$GCP_REGION" \
+              --format 'value(status.url)')"
+            echo "| $service | $revision | $url |" >> "$GITHUB_STEP_SUMMARY"
+          done
