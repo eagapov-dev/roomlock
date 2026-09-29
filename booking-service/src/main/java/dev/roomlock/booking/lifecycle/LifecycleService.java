@@ -1,9 +1,13 @@
 package dev.roomlock.booking.lifecycle;
 
 import dev.roomlock.booking.domain.Booking;
+import dev.roomlock.booking.domain.CancelReason;
 import dev.roomlock.booking.domain.ResourceNotFoundException;
 import dev.roomlock.booking.infra.BookingRepository;
+import dev.roomlock.booking.outbox.BookingOutbox;
 import java.time.Clock;
+import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -19,22 +23,31 @@ public class LifecycleService {
   private static final String BOOKING = "booking";
 
   private final BookingRepository bookings;
+  private final BookingOutbox outbox;
   private final HoldExpiryProperties expiry;
   private final Clock clock;
 
-  public LifecycleService(BookingRepository bookings, HoldExpiryProperties expiry, Clock clock) {
+  public LifecycleService(
+      BookingRepository bookings, BookingOutbox outbox, HoldExpiryProperties expiry, Clock clock) {
     this.bookings = bookings;
+    this.outbox = outbox;
     this.expiry = expiry;
     this.clock = clock;
   }
 
   /**
-   * Cancels one batch of expired holds and returns how many of them were cancelled. Not
-   * transactional here: the sweep is a single statement, which the repository runs in its own
-   * transaction, so a long backlog never becomes one long transaction.
+   * Cancels one batch of expired holds and returns how many of them were cancelled. One transaction
+   * per batch, not per backlog: the statement cancels at most {@code batchSize} rows and their
+   * events are written beside them (rule K-1), so the transaction stays as short as the batch.
    */
+  @Transactional
   public int expireHolds() {
-    return bookings.expireHolds(clock.instant(), expiry.batchSize());
+    Instant now = clock.instant();
+    List<UUID> expired = bookings.expireHolds(now, expiry.batchSize());
+    bookings
+        .findAllById(expired)
+        .forEach(booking -> outbox.recordCancelled(booking, CancelReason.HOLD_EXPIRED));
+    return expired.size();
   }
 
   /**
@@ -44,7 +57,9 @@ public class LifecycleService {
   @Transactional
   public CancelResult cancel(UUID bookingId) {
     if (bookings.cancelHeld(bookingId, clock.instant()) > 0) {
-      return new CancelResult.Cancelled(get(bookingId));
+      Booking cancelled = get(bookingId);
+      outbox.recordCancelled(cancelled, CancelReason.USER_CANCELLED);
+      return new CancelResult.Cancelled(cancelled);
     }
     Booking booking = get(bookingId);
     return switch (booking.getStatus()) {
