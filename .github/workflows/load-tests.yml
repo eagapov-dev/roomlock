@@ -1,20 +1,119 @@
 # Load tests are never part of the regular CI run: they are slow and shared runners
-# give noisy numbers. Started manually only.
+# give noisy numbers. Started manually only, one run per locking strategy.
 name: Load tests
 
 on:
   workflow_dispatch:
+    inputs:
+      strategy:
+        description: Locking strategy the service under test runs with
+        type: choice
+        default: constraint
+        options:
+          - constraint
+          - optimistic
+          - pessimistic
+      users:
+        description: Virtual users of the load phase
+        type: number
+        default: 50
+      duration:
+        description: Seconds the throughput scenario keeps its users busy
+        type: number
+        default: 30
 
 permissions:
   contents: read
 
+concurrency:
+  # Two runs would fight over the same ports and the same database.
+  group: load-tests
+  cancel-in-progress: false
+
 jobs:
   load-tests:
-    name: Gatling load tests
+    name: Gatling load tests (${{ inputs.strategy }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
-      # Placeholder: Gatling scenarios arrive on day 5, then this job gets
-      # checkout, JDK 21, docker compose up and ./gradlew :load-tests:gatlingRun.
-      - name: Placeholder
-        run: echo "Load tests are not implemented yet (planned for day 5)."
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The Gradle toolchain requires Java 21 and auto-provisioning is disabled.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Gradle cache + wrapper checksum validation.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # The compose file of a local run, and its healthcheck, but only the database:
+      # booking-service runs next to the stack so every run can pick its own strategy.
+      - name: Start PostgreSQL
+        run: docker compose -f infra/docker-compose.yml up -d --wait postgres
+
+      - name: Build booking-service
+        run: ./gradlew :booking-service:bootJar
+
+      # roomlock.locking.strategy as an environment variable (Spring relaxed binding);
+      # the datasource defaults of application.yml already point at the compose port 5433.
+      - name: Start booking-service
+        env:
+          ROOMLOCK_LOCKING_STRATEGY: ${{ inputs.strategy }}
+        run: |
+          java -jar booking-service/build/libs/booking-service.jar > booking-service.log 2>&1 &
+          echo "$!" > booking-service.pid
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/actuator/health > /dev/null; then
+              echo "booking-service is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "booking-service did not become healthy in time"
+          cat booking-service.log
+          exit 1
+
+      # All three simulations, sequentially; --all is required because the plugin runs
+      # non-interactively on a runner. An unexpected status fails the task here.
+      - name: Run Gatling simulations
+        env:
+          STRATEGY: ${{ inputs.strategy }}
+          USERS: ${{ inputs.users }}
+          DURATION: ${{ inputs.duration }}
+        run: |
+          ./gradlew :load-tests:gatlingRun --all \
+            --run-description "strategy=$STRATEGY, users=$USERS, duration=${DURATION}s" \
+            "-Droomlock.baseUrl=http://localhost:8080" \
+            "-Droomlock.strategy=$STRATEGY" \
+            "-Droomlock.users=$USERS" \
+            "-Droomlock.duration=$DURATION"
+
+      - name: Stop booking-service
+        if: always()
+        run: |
+          if [ -f booking-service.pid ]; then
+            kill "$(cat booking-service.pid)" || true
+          fi
+
+      # The HTML report of every simulation of this run.
+      - name: Upload Gatling reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gatling-reports-${{ inputs.strategy }}
+          path: load-tests/build/reports/gatling/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload booking-service log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: booking-service-log-${{ inputs.strategy }}
+          path: booking-service.log
+          if-no-files-found: ignore
+          retention-days: 14
