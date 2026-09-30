@@ -6,8 +6,11 @@ the same use case is implemented behind three interchangeable locking strategies
 guard behind them can be switched off to prove the application-level ones, and that everything which
 leaves a service boundary does so through a transactional outbox and is consumed idempotently.
 
-Companion documents: [locking strategies](locking-strategies.md) and
-[reliability guarantees](reliability.md).
+Companion documents: [locking strategies](locking-strategies.md),
+[reliability guarantees](reliability.md), [runbook](runbook.md) for the procedures an on-call person
+runs against the system, and [deployment](deployment.md) for the same architecture on Google Cloud —
+which exists as code in `infra/gcp` and a `cloud` profile document in every service, as a one-off
+demonstration that has not been run against a real project.
 
 ## Modules
 
@@ -74,7 +77,7 @@ migrations are the schema of record and the entities are validated against them 
 
 | Service | Database | Tables | Migrations |
 | --- | --- | --- | --- |
-| booking-service | `booking` | `hotel`, `room`, `booking`, `outbox_event` | `db/migration/V1,V2,V3,V5` plus `db/constraint/V4` |
+| booking-service | `booking` | `hotel`, `room`, `booking`, `outbox_event`, `outbox_lease` | `db/migration/V1,V2,V3,V5,V6` plus `db/constraint/V4` |
 | payment-service | `payment` | `payment` | `payment-service/src/main/resources/db/migration/V1__create_payment.sql` |
 | notification-service | `notification` | `notification` | `notification-service/src/main/resources/db/migration/V1__create_notification.sql` |
 
@@ -96,7 +99,14 @@ The interesting columns and constraints of `booking`
 | `booking_guest_id_idempotency_key_key` | `UNIQUE (guest_id, idempotency_key)` — the idempotency guarantee of a hold, rule I-1. |
 | `booking_no_overlap` (V4, constraint location) | `EXCLUDE USING gist (room_id WITH =, stay WITH &&) WHERE (status IN ('HELD','PAYING','CONFIRMED'))`, on the `btree_gist` extension. |
 | `booking_status_hold_expires_at_idx` | Drives the hold expiry sweep. |
-| `booking_status_payment_started_at_idx` | Exists for the PAYING sweep of the payment flow; nothing in this branch reads it yet. |
+| `booking_status_payment_started_at_idx` | Drives the payment reconciliation sweep: `BookingRepository.leaseStalePayments` reads `status = 'PAYING'` ordered by `payment_started_at`. |
+| `booking_room_id_idx` | `(room_id)`; the bookings of one room, which `BookingRepository.existsActiveOverlap` selects on. |
+
+`outbox_lease` (`db/migration/V6`) is the one table no entity maps. It holds a single row —
+`id`, `holder`, `acquired_at`, `expires_at` — written only by the conditional upsert of
+`booking-service/src/main/java/dev/roomlock/booking/infra/PublisherLease.java`, which is why it is
+plain SQL over `JdbcTemplate` rather than a repository: an `ON CONFLICT DO UPDATE ... WHERE` is not
+something JPA expresses. See [reliability](reliability.md#one-instance-sweeps-at-a-time).
 
 `room.version` is a plain `bigint` column, not a JPA `@Version`: rule DB-8 says it is written by one
 explicit native `UPDATE` and never through the entity
@@ -133,6 +143,8 @@ decision:
 | `RoomRepository.bumpVersion` | `version = :version` | this transaction won the room | it lost the optimistic race |
 | `RoomRepository.insertUnlessNumberTaken` | `ON CONFLICT (hotel_id, number) DO NOTHING` | the room was added | the number is taken in that hotel |
 | `OutboxEventRepository.markPublished` | `published_at IS NULL` | this publisher marked it | it was published twice |
+| `PublisherLease.heldBy` | `holder = excluded.holder OR expires_at <= excluded.acquired_at` | this instance may publish until the new `expires_at` | another instance holds a live lease |
+| `BookingRepository.leaseStalePayments` | `status = 'PAYING'` inside a `FOR UPDATE SKIP LOCKED` CTE, re-stamping `payment_started_at` | this sweep took the booking over | nothing stale, or another sweep took it |
 | `PaymentRepository.insertUnlessBookingCharged` | `ON CONFLICT (booking_id) DO NOTHING` | this call decided the charge | another call decided it first |
 | `PaymentRepository.markRefunded` | `status = 'APPROVED'` | this call refunded | nothing to refund |
 
@@ -206,7 +218,7 @@ sequenceDiagram
   ST-->>HS: Inserted / Busy / Contended / KeyTaken
   HS-->>BC: HoldResult
   BC-->>C: 201 Created, or 200 replay, or 409 problem
-  OP->>DB: SELECT unpublished ORDER BY created_at
+  OP->>DB: take the publisher lease, then SELECT unpublished ORDER BY created_at
   OP->>K: send BookingHeld, key = bookingId
   K-->>OP: ack
   OP->>DB: UPDATE published_at WHERE published_at IS NULL
@@ -270,7 +282,7 @@ The classes behind each step are listed below.
 | the three transitions, each a conditional UPDATE | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentTransitions.java` over `BookingRepository.startPaying` / `confirmPaying` / `declinePaying` |
 | the charge as a port, so the flow can be driven without a provider | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentGateway.java`, `.../payment/ChargeOutcome.java` |
 | the gRPC adapter, with a deadline on every call | `booking-service/src/main/java/dev/roomlock/booking/payment/GrpcPaymentGateway.java`, `.../payment/PaymentChannelConfig.java` |
-| the sweep for a booking left in `PAYING` | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentReconciler.java`, `.../payment/PaymentReconcileScheduler.java` (off under the `test` profile) |
+| the sweep for a booking left in `PAYING` | `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentReconciler.java`, `.../payment/PaymentReconcileScheduler.java` (off under the `test` profile), every `roomlock.payment.reconcile.interval` (10s) over bookings `PAYING` for longer than `.after` (1m), `.batch-size` 100 |
 | the events of each ending | `BookingOutbox.recordConfirmed`, `.recordCancelled`, `.recordRefundRequested`, all `MANDATORY` in the transition's transaction |
 | the charge itself | `payment-service`, idempotent on the booking id, and its `RefundRequested` consumer |
 
@@ -332,21 +344,29 @@ The only module with a REST API; OpenAPI at `/v3/api-docs`, Swagger UI at `/swag
 | `domain` | `Booking`, `Room`, `Hotel`, `OutboxEvent`, `DateRange`, `BookingStatus`, `CancelReason`. Entities hold no transitions. |
 | `hold` | `HoldService` and the three strategies behind `HoldStrategy`, plus `HoldMetrics` and `RequestHash`. |
 | `lifecycle` | `LifecycleService`: the hold expiry sweep and guest cancellation. |
-| `outbox` | `BookingOutbox`, `OutboxWriter`, `OutboxPublisher`, `KafkaEventSender`, `OutboxMetrics`. |
-| `infra` | Repositories, `SqlState`, `ClockConfig`, `SchedulingConfig`. |
+| `payment` | `PaymentService` (the pay use case), `PaymentTransitions`, the `PaymentGateway` port and its `GrpcPaymentGateway` adapter, `PaymentReconciler`, and the `cloud`-only `CloudRunAuthConfig` / `CloudRunAuthInterceptor` / `MetadataServerIdTokens` that put an ID token on every `Charge`. |
+| `money` | `Money` and `MoneyProperties`: minor-unit conversion and the currency of the deployment. |
+| `outbox` | `BookingOutbox`, `OutboxWriter`, `OutboxPublisher`, `OutboxScheduler`, `KafkaEventSender`, `OutboxTopics`, `BookingEvents`, `OutboxMetrics`, `OutboxProperties`. |
+| `infra` | Repositories, `PublisherLease`, `SqlState`, `ClockConfig`, `SchedulingConfig`. |
 
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /api/v1/hotels`, `GET /api/v1/hotels/{id}` | Hotel catalog |
 | `POST /api/v1/hotels/{hotelId}/rooms`, `GET /api/v1/rooms/{id}` | Room catalog; a duplicate number is 409 `room-number-taken` |
 | `POST /api/v1/bookings` | Hold a room; `Idempotency-Key` header is required, max 64 characters |
+| `POST /api/v1/bookings/{id}/pay` | Pay for a booking; no request body, and paying twice answers 200 with the same booking. A provider that gave no answer is 503 `payment-unavailable` and the booking stays `PAYING` |
 | `POST /api/v1/bookings/{id}/cancel` | Guest cancellation; cancelling twice answers 200 again |
 | `GET /api/v1/bookings/{id}` | Read a booking |
 
-Two scheduled sweeps, both disabled under the `test` profile so a test owns the clock and the trigger
-(`SchedulingConfig` is `@Profile("!test")`, and so are `HoldExpiryScheduler` and `OutboxScheduler`;
-rules SP-9, T-7): the hold expiry sweep every `roomlock.hold.expiry.interval` (30s, batch 500) and
-the outbox sweep every `roomlock.outbox.interval` (1s, batch 100).
+Four scheduled triggers in three schedulers, all disabled under the `test` profile so a test owns the
+clock and the trigger (`SchedulingConfig` is `@Profile("!test")`, and so are `HoldExpiryScheduler`,
+`OutboxScheduler` and `PaymentReconcileScheduler`; rules SP-9, T-7): the outbox sweep every
+`roomlock.outbox.interval` (1s, batch 100), the prune of published outbox rows every
+`roomlock.outbox.retention.interval` (1h, `older-than` 7d, batch 1000), the hold expiry sweep every
+`roomlock.hold.expiry.interval` (30s, batch 500) and the payment reconciliation sweep every
+`roomlock.payment.reconcile.interval` (10s, batch 100). Only the outbox sweep is exclusive: it runs
+under the `outbox_lease` of `PublisherLease`, held for `roomlock.outbox.lease` (30s) and renewed on
+every sweep. See [reliability](reliability.md#sweeps-that-clean-up-what-a-crash-left-behind).
 
 ### payment-service
 
@@ -372,6 +392,29 @@ cancellation that caused it. `NotificationSender` is a port; `LoggingNotificatio
 adapter today, and `NotificationChannel` already names `EMAIL` and `SMS` so a real adapter needs no
 schema change.
 
+## Profiles, and the deployment that exists as code
+
+Each service declares its profile names in one place — `dev.roomlock.<service>.Profiles` (rule SP-9) —
+and every one of them now means something.
+
+| Profile | Declared by | What activating it changes |
+| --- | --- | --- |
+| `test` | all three | `SchedulingConfig` and every scheduler drop out, so no `@Scheduled` task is registered and a test owns the clock (rules SP-9, T-7). payment-service and notification-service also have a `test` document in `application.yml` — `grpc.server.port: 0` and a retry backoff of `0s`; booking-service has none. |
+| `no-constraint` | booking-service only | `spring.flyway.locations` drops `classpath:db/constraint`, so `booking_no_overlap` is never created and the application-level strategies stand alone — decision D1, see [locking strategies](locking-strategies.md#the-no-constraint-profile). |
+| `cloud` | all three | The `cloud` document at the end of each `application.yml`: Cloud SQL over private IP, Managed Kafka over `SASL_SSL`/`OAUTHBEARER`, graceful shutdown, health probe groups, a smaller Hikari pool. In booking-service it also switches the gRPC channel to `tls` and activates `CloudRunAuthConfig`, the only bean in the repository that is `@Profile(Profiles.CLOUD)`. |
+
+The Google Cloud deployment those documents are written for exists as code: `infra/gcp` is OpenTofu
+for Cloud Run, Cloud SQL, Managed Service for Apache Kafka, Artifact Registry, Workload Identity
+Federation and Managed Prometheus, and `.github/workflows/deploy.yml` is the manual workflow that
+builds, pushes and rolls out. It is a one-off demonstration rather than a standing environment, and
+**nothing in it has been executed against a real project** — [deployment](deployment.md) says exactly
+which parts are verified without an account and which are not. What the deployment is worth knowing
+for here: it runs **one always-on instance per service** (`min_instance_count = 1`, the default
+`max_instance_count = 1`, `cpu_idle = false` in `infra/gcp/run.tf`), because the four scheduled
+triggers above are not request-driven, and the contract topics are declared with 3 partitions and
+their `.DLT` companions with 1 (`infra/gcp/kafka.tf`) to match `KAFKA_NUM_PARTITIONS` of the compose
+broker.
+
 ## Testing strategy
 
 The test support packages are part of the design, not scaffolding.
@@ -390,23 +433,41 @@ The test support packages are part of the design, not scaffolding.
 | `PaymentGrpcClient` | payment-service | Calls the real server over a real channel rather than in-process, so the transport and generated stubs are covered; the port comes from `local.grpc.port`, published by `spring-grpc-test`. |
 | `RecordingNotificationSender` | notification-service | `@Primary` adapter that makes "delivered exactly once" observable without a channel. |
 | `BookingEventPublisher`, `RefundRequestPublisher` | consumers | Produce contract records onto the real topic, so a consumer test starts at the broker. |
+| `CloudProfileTest` | each module | Refreshes a context with the `cloud` profile and the environment variables that document names, so the `cloud` document of `application.yml` is proved to bind rather than assumed. It is the only automated check of that profile: nothing in CI reaches a Google Cloud project. |
 
 CI (`.github/workflows/ci.yml`) runs `./gradlew spotlessCheck build` on every pull request and push
 to `main` — compilation, formatting check, unit, slice, integration and concurrency tests, with
 Testcontainers on the runner's Docker daemon — and uploads the JUnit and JaCoCo reports. Load tests
 are a separate manual workflow (`.github/workflows/load-tests.yml`); see
-[locking strategies](locking-strategies.md#comparing-them).
+[locking strategies](locking-strategies.md#comparing-them). A third workflow,
+`.github/workflows/deploy.yml`, builds and pushes the images with Jib and rolls out the Cloud Run
+revisions; it is manual only and has never been run against a project — see
+[deployment](deployment.md).
 
 ## Known gaps
 
 - **`payment-api/src/main/proto/payment.proto` has Russian comments** — the only non-English text in
   the repository.
-- **`Profiles.CLOUD` is declared and never used.** `booking-service` and `payment-service` both
-  define `cloud`, but no `application.yml` has a `cloud` document and no bean is conditional on it;
-  notification-service does not declare it at all.
+- **There is no authentication of any kind, and `guestId` is a field of the request body.**
+  No module depends on Spring Security, no filter chain exists, and `HoldBookingRequest` carries
+  `guestId`, so any caller can hold a room in any guest's name. `pay`, `cancel` and
+  `GET /api/v1/bookings/{id}` take only a booking id, so any caller that knows an id can pay for,
+  cancel or read that booking. This is the largest gap in the system and it is deliberate for a
+  concurrency study, but nothing in the code marks the boundary where a real deployment would need one.
+  See [reliability](reliability.md#known-gaps).
 - **`booking-service/src/main/resources/application.yml` has no `test` profile document**, while
   payment-service and notification-service do. Nothing currently needs one, but the asymmetry is
   worth knowing when adding a test-only override.
+- **The cloud deployment is unexecuted, and two of its comments are out of date.** Nothing in
+  `infra/gcp` or `.github/workflows/deploy.yml` has run against a project; `docs/deployment.md` is
+  explicit about that. Separately, `infra/gcp/variables.tf` still justifies `max_instance_count = 1`
+  with "the outbox publisher has no leader election" and `infra/gcp/README.md` still calls
+  `Profiles.CLOUD` declared and unused — both statements predate `PublisherLease` and the `cloud`
+  profile documents.
+- **No measured performance numbers are committed anywhere.** The three strategies are compared
+  qualitatively today: the Grafana dashboard and the Gatling scenarios make them comparable, but no
+  throughput or latency figure is recorded in the repository, so no document quotes one. See
+  [locking strategies](locking-strategies.md#known-gaps).
 - **The compose file has no hook for `roomlock.locking.strategy`.** `README.md` says so and gives the
   workaround (run booking-service next to the infrastructure), but it means the containerised stack
   always runs the `constraint` strategy.
