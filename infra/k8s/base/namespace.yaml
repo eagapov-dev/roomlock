@@ -1,0 +1,30 @@
+# One namespace holds the whole deployment: the three services and the infrastructure they need.
+# It is what everything else is scoped to - Services resolve inside it by short name (postgres,
+# kafka, payment-service), NetworkPolicies select inside it, and `kubectl delete namespace roomlock`
+# is this shape's `docker compose down`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: roomlock
+  labels:
+    app.kubernetes.io/part-of: roomlock
+
+    # POD SECURITY ADMISSION, at the strictest of the three levels. This is a built-in admission
+    # controller, not an add-on: the API server refuses a pod that violates the level, at creation,
+    # with the rule it broke named in the error. There is no equivalent in the other two shapes -
+    # compose has no admission layer at all, and Cloud Run's sandbox makes the question moot by not
+    # letting a container ask for privileges in the first place.
+    #
+    # `restricted` requires, of every pod in this namespace: runAsNonRoot, a non-zero uid, all
+    # capabilities dropped, allowPrivilegeEscalation false, a RuntimeDefault seccomp profile, no host
+    # network/PID/IPC, no hostPath volume and no host port. Every workload here already satisfies it -
+    # the three services, PostgreSQL as uid 70, Kafka as uid 1000 and Prometheus as uid 65534 - so the
+    # label is a check on the manifests rather than a constraint they had to be bent to fit.
+    #
+    # enforce rejects, warn prints at apply time, audit records in the API server's audit log. All
+    # three at the same level, so nothing is discovered only in a log. If a pod added later legitimately
+    # cannot comply (a sidecar that needs NET_ADMIN, say), the honest change is `enforce: baseline` with
+    # a note saying why - not dropping the label.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
