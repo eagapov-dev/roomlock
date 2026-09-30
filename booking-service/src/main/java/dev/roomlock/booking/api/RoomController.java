@@ -4,6 +4,7 @@ import dev.roomlock.booking.catalog.AddRoomCommand;
 import dev.roomlock.booking.catalog.AddRoomResult;
 import dev.roomlock.booking.catalog.CatalogService;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import java.net.URI;
@@ -40,6 +41,7 @@ class RoomController {
 
   @PostMapping(HOTEL_ROOMS)
   @Operation(summary = "Add a room to a hotel")
+  @SecurityRequirement(name = OpenApiConfig.BEARER)
   ResponseEntity<?> add(@PathVariable UUID hotelId, @Valid @RequestBody AddRoomRequest request) {
     AddRoomResult result =
         catalog.addRoom(

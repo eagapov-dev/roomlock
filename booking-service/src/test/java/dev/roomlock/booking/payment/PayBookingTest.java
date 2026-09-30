@@ -76,7 +76,7 @@ class PayBookingTest {
     clock.advance(ONE_MINUTE);
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result).isInstanceOf(PayResult.Confirmed.class);
@@ -94,7 +94,7 @@ class PayBookingTest {
     Booking booking = held();
 
     // when
-    payments.pay(booking.getId());
+    payAsOwner(booking.getId());
 
     // then
     assertThat(provider.received())
@@ -110,7 +110,7 @@ class PayBookingTest {
     clock.advance(ONE_MINUTE);
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result).isEqualTo(new PayResult.Declined(booking.getId(), "AMOUNT_ABOVE_LIMIT"));
@@ -127,7 +127,7 @@ class PayBookingTest {
     provider.declineEverything("INSUFFICIENT_FUNDS");
 
     // when
-    payments.pay(booking.getId());
+    payAsOwner(booking.getId());
 
     // then
     JsonNode event = json.readTree(outbox.payloadOfLast(booking.getId(), BOOKING_CANCELLED));
@@ -139,10 +139,10 @@ class PayBookingTest {
   void shouldChargeOnceAndAnswerTheSameWayWhenBookingIsPaidForTwice() {
     // given
     Booking booking = held();
-    PayResult first = payments.pay(booking.getId());
+    PayResult first = payAsOwner(booking.getId());
 
     // when
-    PayResult second = payments.pay(booking.getId());
+    PayResult second = payAsOwner(booking.getId());
 
     // then
     assertThat(first).isInstanceOf(PayResult.Confirmed.class);
@@ -157,10 +157,10 @@ class PayBookingTest {
   void shouldRefusePaymentWhenBookingIsCancelled() {
     // given
     Booking booking = held();
-    lifecycle.cancel(booking.getId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result)
@@ -173,12 +173,12 @@ class PayBookingTest {
   void shouldRefusePaymentWhenConfirmedBookingWasCancelledAfterwards() {
     // given
     Booking booking = held();
-    payments.pay(booking.getId());
-    lifecycle.cancel(booking.getId());
+    payAsOwner(booking.getId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
     provider.reset();
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result)
@@ -191,11 +191,11 @@ class PayBookingTest {
     // given
     Booking booking = held();
     provider.declineEverything("INSUFFICIENT_FUNDS");
-    payments.pay(booking.getId());
+    payAsOwner(booking.getId());
     provider.reset();
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result)
@@ -211,7 +211,7 @@ class PayBookingTest {
     lifecycle.expireHolds();
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result)
@@ -227,7 +227,7 @@ class PayBookingTest {
     clock.advance(ONE_MINUTE);
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result).isEqualTo(new PayResult.ProviderUnavailable(booking.getId()));
@@ -242,11 +242,11 @@ class PayBookingTest {
     // given
     Booking booking = held();
     provider.beUnavailable();
-    payments.pay(booking.getId());
+    payAsOwner(booking.getId());
     provider.approveEverything();
 
     // when
-    PayResult result = payments.pay(booking.getId());
+    PayResult result = payAsOwner(booking.getId());
 
     // then
     assertThat(result).isInstanceOf(PayResult.Confirmed.class);
@@ -263,7 +263,7 @@ class PayBookingTest {
     // when
     // then
     assertThatExceptionOfType(ResourceNotFoundException.class)
-        .isThrownBy(() -> payments.pay(unknownId))
+        .isThrownBy(() -> payments.pay(unknownId, UUID.randomUUID()))
         .satisfies(
             thrown -> {
               assertThat(thrown.resource()).isEqualTo("booking");
@@ -276,7 +276,7 @@ class PayBookingTest {
   void shouldKeepRoomBusyForAnotherGuestWhenBookingIsConfirmed() {
     // given
     Booking booking = held();
-    payments.pay(booking.getId());
+    payAsOwner(booking.getId());
 
     // when
     HoldResult result = holds.hold(aHold().withRoomId(roomId).build());
@@ -294,12 +294,21 @@ class PayBookingTest {
         bookingTable.insert(aBooking().withRoomId(roomId).withStatus(BookingStatus.PAYING));
 
     // when
-    PayResult result = payments.pay(bookingId);
+    PayResult result = payAsOwner(bookingId);
 
     // then
     assertThat(result).isInstanceOf(PayResult.Confirmed.class);
     assertThat(bookingTable.status(bookingId)).isEqualTo("CONFIRMED");
     assertThat(outbox.typesOf(bookingId)).containsExactly(BOOKING_CONFIRMED);
+  }
+
+  /**
+   * The pay of the guest the booking belongs to. Every booking of this class has one owner, and
+   * paying for somebody else's is not what these tests are about - ApiSecurityIntegrationTest and
+   * BookingOwnershipIntegrationTest cover that.
+   */
+  private PayResult payAsOwner(UUID bookingId) {
+    return payments.pay(bookingId, bookingTable.guestId(bookingId));
   }
 
   private Booking held() {

@@ -53,8 +53,8 @@ public class LifecycleService {
   }
 
   /**
-   * Cancels the booking on behalf of its guest. The conditional UPDATE decides the outcome: it
-   * either wins, or the row is read back to say why it did not (rule J-2).
+   * Cancels the booking of this guest. The conditional UPDATE decides the outcome: it either wins,
+   * or the row is read back to say why it did not (rule J-2).
    *
    * <p>Two UPDATEs rather than one that matches both statuses, because the two endings owe the
    * guest different things and the old status is gone once the row is written: a HELD booking only
@@ -63,7 +63,11 @@ public class LifecycleService {
    * charge is in flight and only the payment flow may decide how it ends.
    */
   @Transactional
-  public CancelResult cancel(UUID bookingId) {
+  public CancelResult cancel(UUID bookingId, UUID guestId) {
+    // Ownership first, and as a read of the row rather than a check of one already read: a booking
+    // of another guest has to come out of here as 404, not 403 - a 403 confirms the id exists.
+    // guest_id never changes, so the UPDATEs below may keep matching on the id alone.
+    ownedBy(bookingId, guestId);
     Instant now = clock.instant();
     if (bookings.cancelHeld(bookingId, now) > 0) {
       Booking cancelled = get(bookingId);
@@ -90,5 +94,11 @@ public class LifecycleService {
     return bookings
         .findById(bookingId)
         .orElseThrow(() -> new ResourceNotFoundException(BOOKING, bookingId));
+  }
+
+  private void ownedBy(UUID bookingId, UUID guestId) {
+    if (bookings.findByIdAndGuestId(bookingId, guestId).isEmpty()) {
+      throw new ResourceNotFoundException(BOOKING, bookingId);
+    }
   }
 }

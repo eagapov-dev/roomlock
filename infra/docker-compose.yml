@@ -1,5 +1,5 @@
-# Local stack: Postgres (booking, payment, notification), Kafka (KRaft), Prometheus, Grafana
-# and the three services (Jib images roomlock/<service>:dev).
+# Local stack: Postgres (booking, payment, notification), Kafka (KRaft), Keycloak, Prometheus,
+# Grafana and the three services (Jib images roomlock/<service>:dev).
 #
 #   ./gradlew jibDockerBuild
 #   docker compose -f infra/docker-compose.yml up -d
@@ -67,6 +67,41 @@ services:
       retries: 12
       start_period: 15s
 
+  # The identity provider of a local run: booking-service validates the guest's access token against
+  # this realm (README.md shows the two commands that get one). Local convenience only - nothing in
+  # infra/gcp runs it, and a deployment brings its own provider (docs/deployment.md).
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.1
+    # start-dev: no TLS, no production hostname checks, the realm imported on every start. A
+    # development mode is the whole point here; it is also why this must not leave a laptop.
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # The one URL every token is minted for, whoever asked. Without it Keycloak derives the issuer
+      # from the request, so a token fetched from the host would carry localhost and one fetched from
+      # a container would carry keycloak:8080 - and booking-service, which validates a single `iss`,
+      # would refuse one of the two. It pins the frontend URL; the keys are fetched from
+      # keycloak:8080 below, which is a different address for the same realm on purpose.
+      KC_HOSTNAME: http://localhost:${KEYCLOAK_PORT:-8088}
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "${KEYCLOAK_PORT:-8088}:8080"
+    volumes:
+      - ./keycloak/roomlock-realm.json:/opt/keycloak/data/import/roomlock-realm.json:ro
+    healthcheck:
+      # The image carries neither curl nor wget, and readiness lives on the management port 9000,
+      # so this asks over bash's own TCP redirection - the one thing the container definitely has.
+      # The endpoint answers 200 once the realm is imported and 503 before that, which is the test.
+      test:
+        - CMD-SHELL
+        - exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\r\n\r\n' >&3 && head -1 <&3 | grep -q 200
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
   prometheus:
     image: prom/prometheus:v3.5.0
     command:
@@ -123,6 +158,12 @@ services:
       # The default is the one of application.yml, so the stack behaves as before without it, and
       # comparing the three strategies here is a variable rather than a run outside the stack (D2).
       ROOMLOCK_LOCKING_STRATEGY: ${ROOMLOCK_LOCKING_STRATEGY:-constraint}
+      # Two addresses for the same Keycloak, and both are needed. The keys are fetched from inside
+      # this network, where localhost is the container itself; the `iss` claim of a token is the
+      # frontend URL Keycloak was pinned to above, which is what a developer on the host asks. The
+      # defaults of application.yml are the host side of both, for a run from the IDE.
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/roomlock/protocol/openid-connect/certs
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: http://localhost:${KEYCLOAK_PORT:-8088}/realms/roomlock
     ports:
       - "${BOOKING_PORT:-8090}:8080"
     depends_on:
@@ -131,6 +172,10 @@ services:
       kafka:
         condition: service_healthy
       payment-service:
+        condition: service_healthy
+      # Not strictly required to start - the JWK set is fetched on the first request that carries a
+      # token, not at startup - but a stack that is up should be a stack that can be called.
+      keycloak:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]

@@ -24,6 +24,35 @@ final class LoadTestSettings {
   /** Label of the locking strategy the service under test is configured with. */
   static final String STRATEGY = property("roomlock.strategy", "unknown");
 
+  /**
+   * An access token minted elsewhere. Set it to point a run at an issuer that has no client
+   * credentials flow, or to reuse a token of a shell session; when it is empty the four parameters
+   * below are exchanged for one instead (see {@link LoadTestToken}).
+   */
+  static final String TOKEN = property("roomlock.token", "");
+
+  /** Token endpoint of the issuer booking-service trusts. */
+  static final String TOKEN_URL =
+      property(
+          "roomlock.tokenUrl",
+          "http://localhost:8088/realms/roomlock/protocol/openid-connect/token");
+
+  /**
+   * Client the run authenticates as. The default is the operator client of
+   * infra/keycloak/roomlock-realm.json, whose token carries both halves a run needs: the
+   * catalog:write scope of the warmup, and a subject to hold and pay as.
+   */
+  static final String CLIENT_ID = property("roomlock.clientId", "roomlock-operator");
+
+  /** Secret of that client. A throwaway of the local stack; any other issuer is given its own. */
+  static final String CLIENT_SECRET = property("roomlock.clientSecret", "roomlock-operator-secret");
+
+  /**
+   * Scopes to ask for, if the issuer does not attach them by default. Empty against the local
+   * realm, which gives the operator client catalog:write without being asked.
+   */
+  static final String SCOPE = property("roomlock.scope", "");
+
   /** Virtual users of the load phase. */
   static final int USERS = intProperty("roomlock.users", 50);
 
@@ -53,11 +82,16 @@ final class LoadTestSettings {
 
   private LoadTestSettings() {}
 
-  /** JSON in, JSON (or problem+json) out, one connection pool per virtual user. */
+  /**
+   * JSON in, JSON (or problem+json) out, one connection pool per virtual user, and the access token
+   * of the run on every request - the catalog writes of the warmup and everything under
+   * /api/v1/bookings need one, and the two catalog reads are simply unbothered by it.
+   */
   static HttpProtocolBuilder httpProtocol() {
     return http.baseUrl(BASE_URL)
         .contentTypeHeader("application/json")
         .acceptHeader("application/json, application/problem+json")
+        .authorizationHeader(LoadTestToken.bearer())
         .userAgentHeader("roomlock-load-tests");
   }
 
@@ -87,7 +121,8 @@ final class LoadTestSettings {
         + ROOMS
         + ", duration="
         + DURATION.toSeconds()
-        + "s";
+        + "s, token from "
+        + LoadTestToken.source();
   }
 
   /** The same banner for a scenario that pays. */

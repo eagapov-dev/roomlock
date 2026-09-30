@@ -37,6 +37,7 @@ Platform and JaCoCo. `roomlock.java-conventions` adds `-Werror` for hand-written
 ```mermaid
 flowchart LR
   C["HTTP client / Gatling"]
+  I["identity provider<br/>Keycloak :8088 locally"]
   B["booking-service<br/>:8080"]
   P["payment-service<br/>HTTP :8081, gRPC :9091"]
   N["notification-service<br/>:8082"]
@@ -45,7 +46,9 @@ flowchart LR
   NDB[("postgres<br/>notification")]
   K{{"Kafka in KRaft mode"}}
 
-  C -->|"REST /api/v1"| B
+  C -->|"get an access token"| I
+  C -->|"REST /api/v1 + Bearer token"| B
+  B -->|"fetch the JWK set once"| I
   B --> BDB
   P --> PDB
   N --> NDB
@@ -56,9 +59,13 @@ flowchart LR
   K -->|"consume refund-requests.v1"| P
 ```
 
-Only two kinds of edge leave a service: one synchronous gRPC call from booking-service to
-payment-service, and Kafka records produced by booking-service and consumed by the other two. No
-service reads another service's database; each owns exactly one.
+Only two kinds of edge leave a service towards another service of this system: one synchronous gRPC
+call from booking-service to payment-service, and Kafka records produced by booking-service and
+consumed by the other two. No service reads another service's database; each owns exactly one.
+
+The third edge leaves the system: booking-service fetches the signing keys of the identity provider,
+once, and validates every access token against them locally. It never asks the provider about a
+request — see [authentication and authorization](#authentication-and-authorization).
 
 The gRPC edge is the only place where a booking waits for another service. Everything else is
 asynchronous, which is why the outbox exists (see [reliability](reliability.md)).
@@ -208,7 +215,8 @@ sequenceDiagram
   participant K as Kafka
   participant NS as notification-service
 
-  C->>BC: POST /api/v1/bookings + Idempotency-Key
+  C->>BC: POST /api/v1/bookings + Idempotency-Key + Bearer token
+  BC->>BC: guest id = subject of the token (Guests)
   BC->>HS: hold(HoldCommand)
   HS->>DB: find room, find booking by guest + key
   HS->>ST: hold(HoldAttempt)
@@ -339,7 +347,7 @@ The only module with a REST API; OpenAPI at `/v3/api-docs`, Swagger UI at `/swag
 
 | Package | Responsibility |
 | --- | --- |
-| `api` | Controllers, request records, `Problems`, `ApiExceptionHandler`, `@StayDates`. HTTP mapping only. |
+| `api` | Controllers, request records, `Problems`, `ApiExceptionHandler`, `@StayDates`, and the edge's authentication: `ApiSecurityConfig` (the filter chain) and `Guests` (which guest a token stands for). HTTP mapping only. |
 | `catalog` | `CatalogService`: create a hotel, add a room, read either. |
 | `domain` | `Booking`, `Room`, `Hotel`, `OutboxEvent`, `DateRange`, `BookingStatus`, `CancelReason`. Entities hold no transitions. |
 | `hold` | `HoldService` and the three strategies behind `HoldStrategy`, plus `HoldMetrics` and `RequestHash`. |
@@ -349,14 +357,22 @@ The only module with a REST API; OpenAPI at `/v3/api-docs`, Swagger UI at `/swag
 | `outbox` | `BookingOutbox`, `OutboxWriter`, `OutboxPublisher`, `OutboxScheduler`, `KafkaEventSender`, `OutboxTopics`, `BookingEvents`, `OutboxMetrics`, `OutboxProperties`. |
 | `infra` | Repositories, `PublisherLease`, `SqlState`, `ClockConfig`, `SchedulingConfig`. |
 
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /api/v1/hotels`, `GET /api/v1/hotels/{id}` | Hotel catalog |
-| `POST /api/v1/hotels/{hotelId}/rooms`, `GET /api/v1/rooms/{id}` | Room catalog; a duplicate number is 409 `room-number-taken` |
-| `POST /api/v1/bookings` | Hold a room; `Idempotency-Key` header is required, max 64 characters |
-| `POST /api/v1/bookings/{id}/pay` | Pay for a booking; no request body, and paying twice answers 200 with the same booking. A provider that gave no answer is 503 `payment-unavailable` and the booking stays `PAYING` |
-| `POST /api/v1/bookings/{id}/cancel` | Guest cancellation; cancelling twice answers 200 again |
-| `GET /api/v1/bookings/{id}` | Read a booking |
+| Endpoint | Requires | Purpose |
+| --- | --- | --- |
+| `GET /api/v1/hotels/{id}` | nothing | Read a hotel |
+| `GET /api/v1/rooms/{id}` | nothing | Read a room |
+| `POST /api/v1/hotels` | scope `catalog:write` | Create a hotel |
+| `POST /api/v1/hotels/{hotelId}/rooms` | scope `catalog:write` | Add a room; a duplicate number is 409 `room-number-taken` |
+| `POST /api/v1/bookings` | any valid token | Hold a room for the token's subject; `Idempotency-Key` header is required, max 64 characters. The body carries no `guestId`, and one that is sent anyway is 400 |
+| `POST /api/v1/bookings/{id}/pay` | any valid token, **own booking** | Pay for a booking; no request body, and paying twice answers 200 with the same booking. A provider that gave no answer is 503 `payment-unavailable` and the booking stays `PAYING` |
+| `POST /api/v1/bookings/{id}/cancel` | any valid token, **own booking** | Guest cancellation; cancelling twice answers 200 again |
+| `GET /api/v1/bookings/{id}` | any valid token, **own booking** | Read a booking |
+| `GET /actuator/health`, `GET /actuator/prometheus` | nothing | Probes and metrics; see below for why they are open |
+| `GET /v3/api-docs`, `GET /swagger-ui.html` | nothing | The OpenAPI document and Swagger UI |
+
+"Own booking" means 404, not 403, for anybody else's — the reasoning is in the next section. Anything
+not in this table answers 403: the chain ends in `anyRequest().denyAll()`, so a new endpoint is closed
+until `ApiSecurityConfig` says otherwise.
 
 Four scheduled triggers in three schedulers, all disabled under the `test` profile so a test owns the
 clock and the trigger (`SchedulingConfig` is `@Profile("!test")`, and so are `HoldExpiryScheduler`,
@@ -391,6 +407,68 @@ the contract cannot be forgotten — the switch stops compiling. `RefundRequeste
 cancellation that caused it. `NotificationSender` is a port; `LoggingNotificationSender` is the only
 adapter today, and `NotificationChannel` already names `EMAIL` and `SMS` so a real adapter needs no
 schema change.
+
+## Authentication and authorization
+
+booking-service is an **OAuth2 resource server**. It validates an RS256 access token against the JWK
+set of the issuer it is configured with, and issues nothing itself: minting belongs to an identity
+provider, and a resource server that signs the tokens it also accepts is its own authority on who a
+caller is. `ApiSecurityConfig` is the whole policy, in one file.
+
+**Where the guest comes from.** The subject of the token, and nowhere else. `HoldBookingRequest` has
+no `guestId` field; `Guests.idOf` turns the subject into the guest id the use cases see — as it stands
+when the subject is a UUID (what Keycloak and most providers issue), otherwise mapped to one over
+`issuer + subject`, because `booking.guest_id` is a `uuid` column that two constraints are built on. A
+body that still sends `guestId` is answered 400 with the field named rather than silently ignored:
+the client was trying to book for somebody, and booking for somebody else instead is the worse of the
+two answers.
+
+**Two levels of access.** Reading the catalog is open — a guest has to see a room and its price
+before signing in, so a token requirement there would only put a login wall in front of public
+information. Writing the catalog needs the `catalog:write` scope, because creating a hotel or adding a
+room is an operator action and a guest token must not be able to do it. Everything under
+`/api/v1/bookings` needs a valid token, and the guest is whoever the token says.
+
+**Ownership, and why 404.** Authentication alone would still let any signed-in guest read, pay for or
+cancel a booking whose id they know, so `GET`, `pay` and `cancel` take the guest id and operate on the
+caller's own booking only. Ownership is a condition of the query — `findByIdAndGuestId`, not a check
+on a row already read — and a booking of somebody else is answered **404, not 403**. A 403 would
+confirm that the id is a real booking, which is exactly what an attacker walking through ids is
+trying to learn; the 404 is the same answer an id that was never created gets, down to the fields of
+the problem body. `guest_id` is `updatable = false`, so the ownership read cannot go stale before the
+conditional UPDATE that follows it.
+
+**Failures.** 401 `urn:roomlock:problem:unauthenticated` with a `WWW-Authenticate: Bearer` header for
+no token, an expired one, a wrong signature or an issuer this deployment does not trust — which of
+those it was is deliberately not said, because the caller can only fix it by getting a new token and
+the distinction is a probe for anybody who never had one. 403 `urn:roomlock:problem:forbidden` for a
+valid token without the scope. Both are written by the filter chain in the same
+`application/problem+json` shape as every failure of a handler, so a client has one error format.
+
+**The actuator stays open.** `/actuator/health` and `/actuator/prometheus` need no token, and that is
+a decision rather than an oversight: every reader of both is a machine that cannot present one. Health
+is read by the Cloud Run startup and liveness probes (`infra/gcp/run.tf`) and by the compose
+healthcheck; the metrics are scraped by Prometheus in `infra/docker-compose.yml`, by the Google
+Managed Prometheus collector sidecar on Cloud Run (`infra/gcp/observability.tf`) and by the
+`prometheus.io/scrape` annotations of the Kubernetes manifests (`infra/k8s/base`, which lives on the
+`build/kubernetes` branch rather than here) — none of which has a credential configured anywhere. A scope there would not fail loudly but silently: a target shown as down and samples nobody
+misses. The exposure list publishes these two endpoints and nothing else, and everything else under
+`/actuator` is denied.
+
+**Locally** the issuer is the Keycloak of `infra/docker-compose.yml`, with the realm of
+`infra/keycloak/roomlock-realm.json` imported on startup — two clients, `roomlock-guest` and
+`roomlock-operator`, and the two commands that fetch a token are in the [README](../README.md). It is
+a local convenience only: nothing in `infra/gcp` runs it, and a deployment sets `OIDC_ISSUER_URI` and
+`OIDC_JWK_SET_URI` to its own provider ([deployment](deployment.md)). **The test suite needs neither.**
+`TestJwts` signs real RS256 tokens with a key pair generated in the JVM and `TestSecurityConfig` gives
+the context the matching public key, so the signature, the expiry and the `iss` claim are validated
+exactly as in production without a container — a suite that needed an identity provider to run is a
+suite people stop running.
+
+payment-service and notification-service get no filter chain and no Spring Security dependency.
+Neither serves a public HTTP API: the gRPC edge is protected by Cloud Run IAM and the ID token of
+`CloudRunAuthInterceptor`, Kafka is internal, and their actuator ports are not reachable from outside
+their instance.
 
 ## Profiles, and the deployment that exists as code
 
@@ -448,13 +526,20 @@ revisions; it is manual only and has never been run against a project — see
 
 - **`payment-api/src/main/proto/payment.proto` has Russian comments** — the only non-English text in
   the repository.
-- **There is no authentication of any kind, and `guestId` is a field of the request body.**
-  No module depends on Spring Security, no filter chain exists, and `HoldBookingRequest` carries
-  `guestId`, so any caller can hold a room in any guest's name. `pay`, `cancel` and
-  `GET /api/v1/bookings/{id}` take only a booking id, so any caller that knows an id can pay for,
-  cancel or read that booking. This is the largest gap in the system and it is deliberate for a
-  concurrency study, but nothing in the code marks the boundary where a real deployment would need one.
-  See [reliability](reliability.md#known-gaps).
+- **Authentication is in place, but it is one filter chain and no more than that.** Tokens are
+  validated and bookings are owned (see [above](#authentication-and-authorization)); what does not
+  exist is everything around that. No refresh handling — a client that lets its access token expire
+  gets a 401 and has to go back to the issuer itself, and nothing in the repository holds a refresh
+  token. No rate limiting or lockout anywhere, so the 404 of a booking somebody else owns can be
+  asked for as fast as the service will answer; ids are random UUIDs, which makes that pointless
+  rather than impossible. No token revocation and no introspection: a token is good until it expires,
+  and `roomlock.accessTokenLifespan` in the local realm is 30 minutes. No admin UI and no operator
+  provisioning — who holds `catalog:write` is a question for the identity provider, and locally the
+  answer is a client secret in a committed realm file. No audit log of who did what, only the
+  application log. No per-guest authorization beyond ownership: there are no roles, no hotel staff and
+  nothing a guest may do to a *hotel's* bookings. And `/actuator/prometheus` is open, which on a
+  Cloud Run deployment with `booking_service_public = true` means the metrics of the service are
+  readable by anybody who can reach its URL. See [reliability](reliability.md#known-gaps).
 - **`booking-service/src/main/resources/application.yml` has no `test` profile document**, while
   payment-service and notification-service do. Nothing currently needs one, but the asymmetry is
   worth knowing when adding a test-only override.

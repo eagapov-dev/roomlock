@@ -14,8 +14,10 @@ import dev.roomlock.booking.support.BookingIntegrationTest;
 import dev.roomlock.booking.support.BookingTable;
 import dev.roomlock.booking.support.DatabaseCleaner;
 import dev.roomlock.booking.support.StubPaymentGateway;
+import dev.roomlock.booking.support.TestData.BookingDraft;
 import dev.roomlock.booking.support.TestData.HoldDraft;
 import dev.roomlock.booking.support.TestData.RoomDraft;
+import dev.roomlock.booking.support.TestJwts;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -30,7 +32,11 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
-/** Paying for a booking through HTTP and the real database (end-to-end scenario). */
+/**
+ * Paying for a booking through HTTP and the real database (end-to-end scenario). Every pay carries
+ * the access token of the guest whose booking it is, because a pay of somebody else's booking is
+ * not a request this API answers at all.
+ */
 @BookingIntegrationTest
 class BookingPayApiIntegrationTest {
 
@@ -56,10 +62,11 @@ class BookingPayApiIntegrationTest {
   @Test
   void shouldReportConfirmedBookingWhenGuestPaysOverHttp() throws Exception {
     // given
-    UUID bookingId = hold(aHold().withRoomId(roomId).withStay(november(10), november(13)));
+    HoldDraft draft = aHold().withRoomId(roomId).withStay(november(10), november(13));
+    UUID bookingId = hold(draft);
 
     // when
-    ResponseEntity<String> response = pay(bookingId);
+    ResponseEntity<String> response = pay(bookingId, draft.guestId());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -67,19 +74,19 @@ class BookingPayApiIntegrationTest {
     assertThat(booking.path("id").asText()).isEqualTo(bookingId.toString());
     assertThat(booking.path("status").asText()).isEqualTo("CONFIRMED");
     assertThat(booking.path("cancelReason").isNull()).isTrue();
-    JsonNode found =
-        json.readTree(rest.getForEntity(BOOKINGS + "/{id}", String.class, bookingId).getBody());
+    JsonNode found = json.readTree(getBooking(bookingId, draft.guestId()).getBody());
     assertThat(found.path("status").asText()).isEqualTo("CONFIRMED");
   }
 
   @Test
   void shouldChargeOnceAndAnswerOkAgainWhenPaymentIsRetried() throws Exception {
     // given
-    UUID bookingId = hold(aHold().withRoomId(roomId));
-    assertThat(pay(bookingId).getStatusCode()).isEqualTo(HttpStatus.OK);
+    HoldDraft draft = aHold().withRoomId(roomId);
+    UUID bookingId = hold(draft);
+    assertThat(pay(bookingId, draft.guestId()).getStatusCode()).isEqualTo(HttpStatus.OK);
 
     // when
-    ResponseEntity<String> retry = pay(bookingId);
+    ResponseEntity<String> retry = pay(bookingId, draft.guestId());
 
     // then
     assertThat(retry.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -90,11 +97,12 @@ class BookingPayApiIntegrationTest {
   @Test
   void shouldReturnConflictWithTheReasonWhenChargeIsDeclined() throws Exception {
     // given
-    UUID bookingId = hold(aHold().withRoomId(roomId));
+    HoldDraft draft = aHold().withRoomId(roomId);
+    UUID bookingId = hold(draft);
     provider.declineEverything("AMOUNT_ABOVE_LIMIT");
 
     // when
-    ResponseEntity<String> response = pay(bookingId);
+    ResponseEntity<String> response = pay(bookingId, draft.guestId());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
@@ -111,15 +119,15 @@ class BookingPayApiIntegrationTest {
   @Test
   void shouldReturnConflictWhenBookingIsCancelled() throws Exception {
     // given
-    UUID bookingId =
-        bookingTable.insert(
-            aBooking()
-                .withRoomId(roomId)
-                .withStay(november(10), november(13))
-                .withStatus(BookingStatus.CANCELLED));
+    BookingDraft draft =
+        aBooking()
+            .withRoomId(roomId)
+            .withStay(november(10), november(13))
+            .withStatus(BookingStatus.CANCELLED);
+    UUID bookingId = bookingTable.insert(draft);
 
     // when
-    ResponseEntity<String> response = pay(bookingId);
+    ResponseEntity<String> response = pay(bookingId, draft.guestId());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
@@ -133,11 +141,12 @@ class BookingPayApiIntegrationTest {
   void shouldReturnServiceUnavailableAndKeepBookingPayingWhenProviderGivesNoAnswer()
       throws Exception {
     // given
-    UUID bookingId = hold(aHold().withRoomId(roomId));
+    HoldDraft draft = aHold().withRoomId(roomId);
+    UUID bookingId = hold(draft);
     provider.beUnavailable();
 
     // when
-    ResponseEntity<String> response = pay(bookingId);
+    ResponseEntity<String> response = pay(bookingId, draft.guestId());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
@@ -154,7 +163,7 @@ class BookingPayApiIntegrationTest {
     UUID unknownId = UUID.randomUUID();
 
     // when
-    ResponseEntity<String> response = pay(unknownId);
+    ResponseEntity<String> response = pay(unknownId, UUID.randomUUID());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
@@ -163,18 +172,25 @@ class BookingPayApiIntegrationTest {
     assertThat(problem.path("resource").asText()).isEqualTo("booking");
   }
 
-  private ResponseEntity<String> pay(UUID bookingId) {
-    return rest.postForEntity(PAY, null, String.class, bookingId);
+  private ResponseEntity<String> pay(UUID bookingId, UUID guestId) {
+    return rest.exchange(PAY, HttpMethod.POST, guestRequest(guestId), String.class, bookingId);
+  }
+
+  private ResponseEntity<String> getBooking(UUID bookingId, UUID guestId) {
+    return rest.exchange(
+        BOOKINGS + "/{id}", HttpMethod.GET, guestRequest(guestId), String.class, bookingId);
+  }
+
+  private static HttpEntity<Void> guestRequest(UUID guestId) {
+    return new HttpEntity<>(TestJwts.bearer(TestJwts.guest(guestId)));
   }
 
   private UUID hold(HoldDraft draft) throws Exception {
     Map<String, Object> body = new LinkedHashMap<>();
     body.put("roomId", draft.roomId());
-    body.put("guestId", draft.guestId());
     body.put("checkIn", draft.checkIn().toString());
     body.put("checkOut", draft.checkOut().toString());
-    HttpHeaders headers = new HttpHeaders();
-    headers.setContentType(MediaType.APPLICATION_JSON);
+    HttpHeaders headers = TestJwts.jsonBearer(TestJwts.guest(draft.guestId()));
     headers.set(IDEMPOTENCY_KEY, draft.idempotencyKey());
     ResponseEntity<String> created =
         rest.exchange(BOOKINGS, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
@@ -184,21 +200,28 @@ class BookingPayApiIntegrationTest {
 
   private UUID createRoom() throws Exception {
     ResponseEntity<String> hotel =
-        rest.postForEntity(
+        rest.exchange(
             "/api/v1/hotels",
-            Map.of("name", aHotel().name(), "city", aHotel().city()),
+            HttpMethod.POST,
+            operatorRequest(Map.of("name", aHotel().name(), "city", aHotel().city())),
             String.class);
     UUID hotelId = UUID.fromString(json.readTree(hotel.getBody()).path("id").asText());
     RoomDraft room = aRoom();
     ResponseEntity<String> created =
-        rest.postForEntity(
+        rest.exchange(
             "/api/v1/hotels/{id}/rooms",
-            Map.of(
-                "number", room.number(),
-                "capacity", room.capacity(),
-                "pricePerNight", room.pricePerNight()),
+            HttpMethod.POST,
+            operatorRequest(
+                Map.of(
+                    "number", room.number(),
+                    "capacity", room.capacity(),
+                    "pricePerNight", room.pricePerNight())),
             String.class,
             hotelId);
     return UUID.fromString(json.readTree(created.getBody()).path("id").asText());
+  }
+
+  private static HttpEntity<Object> operatorRequest(Object body) {
+    return new HttpEntity<>(body, TestJwts.jsonBearer(TestJwts.operator()));
   }
 }

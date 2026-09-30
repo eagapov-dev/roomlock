@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.roomlock.booking.domain.Booking;
@@ -34,12 +35,14 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.JwtRequestPostProcessor;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.springframework.test.web.servlet.assertj.MvcTestResult;
 
 @WebMvcTest(BookingController.class)
-@Import(Problems.class)
+@Import({Problems.class, ApiSecurityConfig.class})
 class BookingControllerTest {
 
   private static final String BOOKINGS = "/api/v1/bookings";
@@ -50,6 +53,12 @@ class BookingControllerTest {
   @MockitoBean private HoldService holds;
   @MockitoBean private PaymentService payments;
   @MockitoBean private LifecycleService lifecycle;
+
+  /**
+   * The chain of {@link ApiSecurityConfig} needs a decoder to be built; no test here sends a real
+   * token, {@code jwt()} installs the authentication directly.
+   */
+  @MockitoBean private JwtDecoder jwtDecoder;
 
   @Test
   void shouldReturnCreatedWithLocationWhenRoomIsHeld() throws Exception {
@@ -98,6 +107,46 @@ class BookingControllerTest {
     assertThat(command.getValue().stay())
         .isEqualTo(new DateRange(draft.checkIn(), draft.checkOut()));
     assertThat(command.getValue().idempotencyKey()).isEqualTo(draft.idempotencyKey());
+  }
+
+  /**
+   * The point of the whole change: the body says which room, the token says who. A hold is created
+   * for the subject of the token even when the body never mentioned a guest.
+   */
+  @Test
+  void shouldTakeTheGuestIdFromTheTokenWhenHolding() throws Exception {
+    // given
+    HoldDraft draft = aHold();
+    given(holds.hold(any())).willReturn(new HoldResult.Held(bookingOf(draft)));
+    assertThat(holdBody(draft)).doesNotContainKey("guestId");
+
+    // when
+    postHold(draft);
+
+    // then
+    ArgumentCaptor<HoldCommand> command = ArgumentCaptor.forClass(HoldCommand.class);
+    then(holds).should().hold(command.capture());
+    assertThat(command.getValue().guestId()).isEqualTo(draft.guestId());
+  }
+
+  /**
+   * Rejected rather than ignored: a client that still sends {@code guestId} was trying to book for
+   * somebody, and silently booking for somebody else would be the worse answer of the two.
+   */
+  @Test
+  void shouldReturnValidationErrorWhenBodyStillCarriesGuestId() throws Exception {
+    // given
+    HoldDraft draft = aHold();
+    Map<String, Object> body = holdBody(draft);
+    body.put("guestId", UUID.randomUUID());
+
+    // when
+    MvcTestResult result = postBody(draft.guestId(), draft.idempotencyKey(), body);
+
+    // then
+    assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error");
+    assertThat(result).bodyJson().extractingPath("$.errors[*].field").asArray().contains("guestId");
+    then(holds).shouldHaveNoInteractions();
   }
 
   @Test
@@ -193,6 +242,7 @@ class BookingControllerTest {
     MvcTestResult result =
         mvc.post()
             .uri(BOOKINGS)
+            .with(guest(draft.guestId()))
             .contentType(MediaType.APPLICATION_JSON)
             .content(json.writeValueAsString(holdBody(draft)))
             .exchange();
@@ -248,7 +298,7 @@ class BookingControllerTest {
     body.remove("roomId");
 
     // when
-    MvcTestResult result = postBody(draft.idempotencyKey(), body);
+    MvcTestResult result = postBody(draft.guestId(), draft.idempotencyKey(), body);
 
     // then
     assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error");
@@ -263,7 +313,7 @@ class BookingControllerTest {
     body.put("checkIn", "2026-13-45");
 
     // when
-    MvcTestResult result = postBody(draft.idempotencyKey(), body);
+    MvcTestResult result = postBody(draft.guestId(), draft.idempotencyKey(), body);
 
     // then
     assertProblem(result, HttpStatus.BAD_REQUEST, "validation-error");
@@ -273,10 +323,14 @@ class BookingControllerTest {
   void shouldReturnBookingWhenItExists() {
     // given
     Booking booking = bookingOf(aHold());
-    given(holds.getBooking(booking.getId())).willReturn(booking);
+    given(holds.getBooking(booking.getId(), booking.getGuestId())).willReturn(booking);
 
     // when
-    MvcTestResult result = mvc.get().uri(BOOKINGS + "/{id}", booking.getId()).exchange();
+    MvcTestResult result =
+        mvc.get()
+            .uri(BOOKINGS + "/{id}", booking.getId())
+            .with(guest(booking.getGuestId()))
+            .exchange();
 
     // then
     assertThat(result).hasStatus(HttpStatus.OK);
@@ -288,11 +342,13 @@ class BookingControllerTest {
   void shouldReturnNotFoundWhenBookingIsUnknown() {
     // given
     UUID unknownId = UUID.randomUUID();
-    given(holds.getBooking(unknownId))
+    UUID guestId = UUID.randomUUID();
+    given(holds.getBooking(unknownId, guestId))
         .willThrow(new ResourceNotFoundException("booking", unknownId));
 
     // when
-    MvcTestResult result = mvc.get().uri(BOOKINGS + "/{id}", unknownId).exchange();
+    MvcTestResult result =
+        mvc.get().uri(BOOKINGS + "/{id}", unknownId).with(guest(guestId)).exchange();
 
     // then
     assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
@@ -303,10 +359,11 @@ class BookingControllerTest {
   void shouldReturnOkWhenBookingIsCancelled() {
     // given
     Booking booking = bookingOf(aHold());
-    given(lifecycle.cancel(booking.getId())).willReturn(new CancelResult.Cancelled(booking));
+    given(lifecycle.cancel(booking.getId(), booking.getGuestId()))
+        .willReturn(new CancelResult.Cancelled(booking));
 
     // when
-    MvcTestResult result = postCancel(booking.getId());
+    MvcTestResult result = postCancel(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(result).hasStatus(HttpStatus.OK);
@@ -317,10 +374,11 @@ class BookingControllerTest {
   void shouldReturnOkWhenBookingIsAlreadyCancelled() {
     // given
     Booking booking = bookingOf(aHold());
-    given(lifecycle.cancel(booking.getId())).willReturn(new CancelResult.AlreadyCancelled(booking));
+    given(lifecycle.cancel(booking.getId(), booking.getGuestId()))
+        .willReturn(new CancelResult.AlreadyCancelled(booking));
 
     // when
-    MvcTestResult result = postCancel(booking.getId());
+    MvcTestResult result = postCancel(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(result).hasStatus(HttpStatus.OK);
@@ -332,10 +390,11 @@ class BookingControllerTest {
   void shouldReturnOkWhenConfirmedBookingIsCancelled() {
     // given
     Booking booking = bookingOf(aHold());
-    given(lifecycle.cancel(booking.getId())).willReturn(new CancelResult.Cancelled(booking));
+    given(lifecycle.cancel(booking.getId(), booking.getGuestId()))
+        .willReturn(new CancelResult.Cancelled(booking));
 
     // when
-    MvcTestResult result = postCancel(booking.getId());
+    MvcTestResult result = postCancel(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(result).hasStatus(HttpStatus.OK);
@@ -346,11 +405,12 @@ class BookingControllerTest {
   void shouldReturnConflictWhenBookingIsPaying() {
     // given
     UUID bookingId = UUID.randomUUID();
-    given(lifecycle.cancel(bookingId))
+    UUID guestId = UUID.randomUUID();
+    given(lifecycle.cancel(bookingId, guestId))
         .willReturn(new CancelResult.NotCancellable(bookingId, BookingStatus.PAYING));
 
     // when
-    MvcTestResult result = postCancel(bookingId);
+    MvcTestResult result = postCancel(bookingId, guestId);
 
     // then
     assertProblem(result, HttpStatus.CONFLICT, "booking-not-cancellable");
@@ -361,11 +421,12 @@ class BookingControllerTest {
   void shouldReturnNotFoundWhenBookingOfTheCancelIsUnknown() {
     // given
     UUID unknownId = UUID.randomUUID();
-    given(lifecycle.cancel(unknownId))
+    UUID guestId = UUID.randomUUID();
+    given(lifecycle.cancel(unknownId, guestId))
         .willThrow(new ResourceNotFoundException("booking", unknownId));
 
     // when
-    MvcTestResult result = postCancel(unknownId);
+    MvcTestResult result = postCancel(unknownId, guestId);
 
     // then
     assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
@@ -377,10 +438,11 @@ class BookingControllerTest {
   void shouldReturnOkWithTheBookingWhenChargeIsApproved() {
     // given
     Booking booking = bookingOf(aHold());
-    given(payments.pay(booking.getId())).willReturn(new PayResult.Confirmed(booking));
+    given(payments.pay(booking.getId(), booking.getGuestId()))
+        .willReturn(new PayResult.Confirmed(booking));
 
     // when
-    MvcTestResult result = postPay(booking.getId());
+    MvcTestResult result = postPay(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(result).hasStatus(HttpStatus.OK);
@@ -392,10 +454,11 @@ class BookingControllerTest {
   void shouldReturnOkWhenBookingWasAlreadyConfirmed() {
     // given
     Booking booking = bookingOf(aHold());
-    given(payments.pay(booking.getId())).willReturn(new PayResult.AlreadyConfirmed(booking));
+    given(payments.pay(booking.getId(), booking.getGuestId()))
+        .willReturn(new PayResult.AlreadyConfirmed(booking));
 
     // when
-    MvcTestResult result = postPay(booking.getId());
+    MvcTestResult result = postPay(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(result).hasStatus(HttpStatus.OK);
@@ -406,11 +469,12 @@ class BookingControllerTest {
   void shouldReturnConflictWithTheReasonWhenChargeIsDeclined() {
     // given
     UUID bookingId = UUID.randomUUID();
-    given(payments.pay(bookingId))
+    UUID guestId = UUID.randomUUID();
+    given(payments.pay(bookingId, guestId))
         .willReturn(new PayResult.Declined(bookingId, "INSUFFICIENT_FUNDS"));
 
     // when
-    MvcTestResult result = postPay(bookingId);
+    MvcTestResult result = postPay(bookingId, guestId);
 
     // then
     assertProblem(result, HttpStatus.CONFLICT, "payment-declined");
@@ -422,11 +486,12 @@ class BookingControllerTest {
   void shouldReturnConflictWithTheStatusWhenBookingIsNotPayable() {
     // given
     UUID bookingId = UUID.randomUUID();
-    given(payments.pay(bookingId))
+    UUID guestId = UUID.randomUUID();
+    given(payments.pay(bookingId, guestId))
         .willReturn(new PayResult.NotPayable(bookingId, BookingStatus.CANCELLED));
 
     // when
-    MvcTestResult result = postPay(bookingId);
+    MvcTestResult result = postPay(bookingId, guestId);
 
     // then
     assertProblem(result, HttpStatus.CONFLICT, "booking-not-payable");
@@ -439,10 +504,12 @@ class BookingControllerTest {
   void shouldReturnServiceUnavailableWhenProviderGaveNoAnswer() {
     // given
     UUID bookingId = UUID.randomUUID();
-    given(payments.pay(bookingId)).willReturn(new PayResult.ProviderUnavailable(bookingId));
+    UUID guestId = UUID.randomUUID();
+    given(payments.pay(bookingId, guestId))
+        .willReturn(new PayResult.ProviderUnavailable(bookingId));
 
     // when
-    MvcTestResult result = postPay(bookingId);
+    MvcTestResult result = postPay(bookingId, guestId);
 
     // then
     assertProblem(result, HttpStatus.SERVICE_UNAVAILABLE, "payment-unavailable");
@@ -453,10 +520,12 @@ class BookingControllerTest {
   void shouldReturnNotFoundWhenBookingOfThePaymentIsUnknown() {
     // given
     UUID unknownId = UUID.randomUUID();
-    given(payments.pay(unknownId)).willThrow(new ResourceNotFoundException("booking", unknownId));
+    UUID guestId = UUID.randomUUID();
+    given(payments.pay(unknownId, guestId))
+        .willThrow(new ResourceNotFoundException("booking", unknownId));
 
     // when
-    MvcTestResult result = postPay(unknownId);
+    MvcTestResult result = postPay(unknownId, guestId);
 
     // then
     assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
@@ -464,12 +533,17 @@ class BookingControllerTest {
     assertThat(result).bodyJson().extractingPath("$.id").isEqualTo(unknownId.toString());
   }
 
-  private MvcTestResult postPay(UUID bookingId) {
-    return mvc.post().uri(BOOKINGS + "/{id}/pay", bookingId).exchange();
+  private MvcTestResult postPay(UUID bookingId, UUID guestId) {
+    return mvc.post().uri(BOOKINGS + "/{id}/pay", bookingId).with(guest(guestId)).exchange();
   }
 
-  private MvcTestResult postCancel(UUID bookingId) {
-    return mvc.post().uri(BOOKINGS + "/{id}/cancel", bookingId).exchange();
+  private MvcTestResult postCancel(UUID bookingId, UUID guestId) {
+    return mvc.post().uri(BOOKINGS + "/{id}/cancel", bookingId).with(guest(guestId)).exchange();
+  }
+
+  /** An authenticated guest: the subject of the token is the guest id the use case will see. */
+  private static JwtRequestPostProcessor guest(UUID guestId) {
+    return jwt().jwt(token -> token.subject(guestId.toString()));
   }
 
   private static Booking bookingOf(HoldDraft draft) {
@@ -482,12 +556,14 @@ class BookingControllerTest {
   }
 
   private MvcTestResult postHold(HoldDraft draft) throws Exception {
-    return postBody(draft.idempotencyKey(), holdBody(draft));
+    return postBody(draft.guestId(), draft.idempotencyKey(), holdBody(draft));
   }
 
-  private MvcTestResult postBody(String idempotencyKey, Map<String, Object> body) throws Exception {
+  private MvcTestResult postBody(UUID guestId, String idempotencyKey, Map<String, Object> body)
+      throws Exception {
     return mvc.post()
         .uri(BOOKINGS)
+        .with(guest(guestId))
         .header(IDEMPOTENCY_KEY, idempotencyKey)
         .contentType(MediaType.APPLICATION_JSON)
         .content(json.writeValueAsString(body))
@@ -497,7 +573,6 @@ class BookingControllerTest {
   private static Map<String, Object> holdBody(HoldDraft draft) {
     Map<String, Object> body = new LinkedHashMap<>();
     body.put("roomId", draft.roomId());
-    body.put("guestId", draft.guestId());
     body.put("checkIn", draft.checkIn().toString());
     body.put("checkOut", draft.checkOut().toString());
     return body;

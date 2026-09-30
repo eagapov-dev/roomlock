@@ -72,6 +72,20 @@ class PaymentTransitions {
     return get(bookingId);
   }
 
+  /**
+   * The booking, if this guest owns it; otherwise it is reported as missing (rule E-4). 404 and not
+   * 403 on purpose: a 403 would tell a caller that only guessed the id that the id is real. Asked
+   * as a query of both columns rather than as a check of a row already read, so nothing in between
+   * has to be trusted - and {@code guest_id} is {@code updatable = false}, so the answer cannot
+   * age.
+   */
+  @Transactional(readOnly = true)
+  Booking ownedBy(UUID bookingId, UUID guestId) {
+    return bookings
+        .findByIdAndGuestId(bookingId, guestId)
+        .orElseThrow(() -> new ResourceNotFoundException(BOOKING, bookingId));
+  }
+
   @Transactional(readOnly = true)
   Booking get(UUID bookingId) {
     return bookings

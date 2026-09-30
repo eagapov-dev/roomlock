@@ -25,6 +25,29 @@ final class Problems {
     return problem;
   }
 
+  /**
+   * No usable access token: none was sent, or the one that was cannot be verified - a wrong
+   * signature, an expired token, an issuer this deployment does not trust. Which of those it was is
+   * deliberately not said (rule E-2): the caller can only fix it by getting a new token, and the
+   * distinction is a probe for anyone who did not have one to begin with.
+   */
+  ProblemDetail unauthenticated() {
+    return problem(
+        HttpStatus.UNAUTHORIZED,
+        "unauthenticated",
+        "Unauthenticated",
+        "This endpoint requires a valid access token");
+  }
+
+  /** The token is valid but does not carry the scope this endpoint asks for. */
+  ProblemDetail forbidden() {
+    return problem(
+        HttpStatus.FORBIDDEN,
+        "forbidden",
+        "Forbidden",
+        "This access token may not perform this operation");
+  }
+
   ProblemDetail notFound(String resource, UUID id) {
     ProblemDetail problem =
         problem(

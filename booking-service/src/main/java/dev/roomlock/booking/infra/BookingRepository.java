@@ -18,6 +18,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
   Optional<Booking> findByGuestIdAndIdempotencyKey(UUID guestId, String idempotencyKey);
 
   /**
+   * The booking, if it belongs to this guest. Ownership is a condition of the query rather than a
+   * check on the row it returned, so a caller that does not own the booking gets an empty {@link
+   * Optional} - and with it a 404 - and learns nothing about whether the id exists. A 403 would
+   * answer that question for anybody enumerating ids. {@code guest_id} is {@code updatable =
+   * false}, so this can never go stale between the read and what follows it.
+   */
+  Optional<Booking> findByIdAndGuestId(UUID id, UUID guestId);
+
+  /**
    * Whether a booking that still holds the room covers a night of the stay: the statuses and the
    * half-open overlap of {@code booking_no_overlap}, asked by the application (D2).
    */

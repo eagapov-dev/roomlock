@@ -173,7 +173,7 @@ class HoldServiceTest {
     Booking held = ((HoldResult.Held) holds.hold(aHold().withRoomId(roomId).build())).booking();
 
     // when
-    Booking found = holds.getBooking(held.getId());
+    Booking found = holds.getBooking(held.getId(), held.getGuestId());
 
     // then
     assertThat(found.getId()).isEqualTo(held.getId());
@@ -188,7 +188,7 @@ class HoldServiceTest {
     // when
     // then
     assertThatExceptionOfType(ResourceNotFoundException.class)
-        .isThrownBy(() -> holds.getBooking(unknownId))
+        .isThrownBy(() -> holds.getBooking(unknownId, UUID.randomUUID()))
         .satisfies(thrown -> assertThat(thrown.resource()).isEqualTo("booking"));
   }
 

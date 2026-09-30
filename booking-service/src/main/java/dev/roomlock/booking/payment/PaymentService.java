@@ -41,10 +41,13 @@ public class PaymentService {
   }
 
   /**
-   * Pays for the booking. The conditional UPDATE decides where the flow goes: it either wins and
-   * the charge follows, or the row is read back to say why it did not (rule J-2).
+   * Pays for the booking of this guest. The conditional UPDATE decides where the flow goes: it
+   * either wins and the charge follows, or the row is read back to say why it did not (rule J-2).
    */
-  public PayResult pay(UUID bookingId) {
+  public PayResult pay(UUID bookingId, UUID guestId) {
+    // Before anything is charged or written: a booking of another guest leaves here as 404, and the
+    // provider is never asked about it (PaymentTransitions.ownedBy).
+    transitions.ownedBy(bookingId, guestId);
     if (transitions.startPaying(bookingId, clock.instant())) {
       return chargeAndApply(transitions.get(bookingId));
     }

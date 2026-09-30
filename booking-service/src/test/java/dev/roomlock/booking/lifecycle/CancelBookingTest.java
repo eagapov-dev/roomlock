@@ -60,7 +60,7 @@ class CancelBookingTest {
     clock.advance(ONE_MINUTE);
 
     // when
-    CancelResult result = lifecycle.cancel(bookingId);
+    CancelResult result = cancelAsOwner(bookingId);
 
     // then
     assertThat(result).isInstanceOf(CancelResult.Cancelled.class);
@@ -76,12 +76,12 @@ class CancelBookingTest {
     // given
     UUID bookingId = bookingTable.insert(aBooking().withRoomId(roomId));
     clock.advance(ONE_MINUTE);
-    lifecycle.cancel(bookingId);
+    cancelAsOwner(bookingId);
     Instant cancelledAt = clock.instant();
     clock.advance(ONE_MINUTE);
 
     // when
-    CancelResult result = lifecycle.cancel(bookingId);
+    CancelResult result = cancelAsOwner(bookingId);
 
     // then
     assertThat(result).isInstanceOf(CancelResult.AlreadyCancelled.class);
@@ -101,7 +101,7 @@ class CancelBookingTest {
                 .withCancelReason(CancelReason.HOLD_EXPIRED));
 
     // when
-    CancelResult result = lifecycle.cancel(bookingId);
+    CancelResult result = cancelAsOwner(bookingId);
 
     // then
     assertThat(result).isInstanceOf(CancelResult.AlreadyCancelled.class);
@@ -117,7 +117,7 @@ class CancelBookingTest {
     clock.advance(ONE_MINUTE);
 
     // when
-    CancelResult result = lifecycle.cancel(bookingId);
+    CancelResult result = cancelAsOwner(bookingId);
 
     // then
     assertThat(result).isInstanceOf(CancelResult.Cancelled.class);
@@ -133,7 +133,7 @@ class CancelBookingTest {
     // given
     UUID bookingId =
         bookingTable.insert(aBooking().withRoomId(roomId).withStatus(BookingStatus.CONFIRMED));
-    lifecycle.cancel(bookingId);
+    cancelAsOwner(bookingId);
 
     // when
     HoldResult result =
@@ -150,7 +150,7 @@ class CancelBookingTest {
         bookingTable.insert(aBooking().withRoomId(roomId).withStatus(BookingStatus.PAYING));
 
     // when
-    CancelResult result = lifecycle.cancel(bookingId);
+    CancelResult result = cancelAsOwner(bookingId);
 
     // then
     assertThat(result).isEqualTo(new CancelResult.NotCancellable(bookingId, BookingStatus.PAYING));
@@ -165,7 +165,7 @@ class CancelBookingTest {
     // when
     // then
     assertThatExceptionOfType(ResourceNotFoundException.class)
-        .isThrownBy(() -> lifecycle.cancel(unknownId))
+        .isThrownBy(() -> lifecycle.cancel(unknownId, UUID.randomUUID()))
         .satisfies(
             thrown -> {
               assertThat(thrown.resource()).isEqualTo("booking");
@@ -178,7 +178,8 @@ class CancelBookingTest {
     // given
     HoldResult held =
         holds.hold(aHold().withRoomId(roomId).withStay(november(10), november(13)).build());
-    lifecycle.cancel(((HoldResult.Held) held).booking().getId());
+    Booking heldBooking = ((HoldResult.Held) held).booking();
+    lifecycle.cancel(heldBooking.getId(), heldBooking.getGuestId());
 
     // when
     HoldResult result =
@@ -191,6 +192,11 @@ class CancelBookingTest {
 
   private Booking reload(UUID bookingId) {
     return bookings.findById(bookingId).orElseThrow();
+  }
+
+  /** The cancel of the guest the booking belongs to; ownership itself is covered end to end. */
+  private CancelResult cancelAsOwner(UUID bookingId) {
+    return lifecycle.cancel(bookingId, bookingTable.guestId(bookingId));
   }
 
   private UUID newRoom() {

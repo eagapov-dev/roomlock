@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.roomlock.booking.catalog.AddRoomCommand;
@@ -26,12 +27,15 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.JwtRequestPostProcessor;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.springframework.test.web.servlet.assertj.MvcTestResult;
 
 @WebMvcTest(RoomController.class)
-@Import(Problems.class)
+@Import({Problems.class, ApiSecurityConfig.class})
 class RoomControllerTest {
 
   private static final String HOTEL_ROOMS = "/api/v1/hotels/{hotelId}/rooms";
@@ -40,6 +44,7 @@ class RoomControllerTest {
   @Autowired private MockMvcTester mvc;
   @Autowired private ObjectMapper json;
   @MockitoBean private CatalogService catalog;
+  @MockitoBean private JwtDecoder jwtDecoder;
 
   @Test
   void shouldReturnCreatedWithRoomIdWhenRoomIsValid() throws Exception {
@@ -214,9 +219,16 @@ class RoomControllerTest {
   private MvcTestResult postRoom(UUID hotelId, Map<String, Object> body) throws Exception {
     return mvc.post()
         .uri(HOTEL_ROOMS, hotelId)
+        .with(operator())
         .contentType(MediaType.APPLICATION_JSON)
         .content(json.writeValueAsString(body))
         .exchange();
+  }
+
+  /** An operator token: adding a room needs the scope, reading one needs nothing. */
+  private static JwtRequestPostProcessor operator() {
+    return jwt()
+        .authorities(new SimpleGrantedAuthority("SCOPE_" + ApiSecurityConfig.CATALOG_WRITE));
   }
 
   private static Map<String, Object> roomBody(RoomDraft draft) {

@@ -66,10 +66,14 @@ public class HoldService {
     return resultOf(command, requestHash, outcome);
   }
 
+  /**
+   * The booking of this guest. A booking of somebody else is answered as if it did not exist (rule
+   * E-4): 404 and not 403, because a 403 tells a caller that guessed the id that the id is real.
+   */
   @Transactional(readOnly = true)
-  public Booking getBooking(UUID bookingId) {
+  public Booking getBooking(UUID bookingId, UUID guestId) {
     return bookings
-        .findById(bookingId)
+        .findByIdAndGuestId(bookingId, guestId)
         .orElseThrow(() -> new ResourceNotFoundException(BOOKING, bookingId));
   }
 

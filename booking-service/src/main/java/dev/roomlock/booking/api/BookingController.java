@@ -10,6 +10,7 @@ import dev.roomlock.booking.lifecycle.LifecycleService;
 import dev.roomlock.booking.payment.PayResult;
 import dev.roomlock.booking.payment.PaymentService;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -19,6 +20,8 @@ import java.util.UUID;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -33,12 +36,20 @@ import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
  * {@link HoldResult}, {@link PayResult} and {@link CancelResult} to a status: a replay of the same
  * request answers 200, a first hold 201, a booking that can no longer be paid for or cancelled 409,
  * and a payment provider that gave no answer 503.
+ *
+ * <p>Every endpoint here acts for one guest, and that guest is the subject of the access token
+ * ({@link Guests}) - the request body and the path say which room and which booking, never who.
+ * Each of the four use cases is given the guest id, and the three that take an existing booking
+ * answer <strong>404, not 403</strong>, for a booking of somebody else: a 403 would confirm that
+ * the id exists, which is exactly what an attacker enumerating ids is trying to find out. So a
+ * booking the caller does not own is indistinguishable from one that was never created.
  */
 @RestController
 @RequestMapping(BookingController.BOOKINGS)
 @Tag(
     name = "Bookings",
     description = "Holding a room for a stay, paying for it and cancelling a booking")
+@SecurityRequirement(name = OpenApiConfig.BEARER)
 class BookingController {
 
   static final String BOOKINGS = "/api/v1/bookings";
@@ -64,12 +75,13 @@ class BookingController {
   ResponseEntity<?> hold(
       @RequestHeader(name = IDEMPOTENCY_KEY) @NotBlank @Size(max = IDEMPOTENCY_KEY_MAX)
           String idempotencyKey,
-      @Valid @RequestBody HoldBookingRequest request) {
+      @Valid @RequestBody HoldBookingRequest request,
+      @AuthenticationPrincipal Jwt token) {
     HoldResult result =
         holds.hold(
             new HoldCommand(
                 request.roomId(),
-                request.guestId(),
+                Guests.idOf(token),
                 new DateRange(request.checkIn(), request.checkOut()),
                 idempotencyKey));
     return switch (result) {
@@ -91,8 +103,8 @@ class BookingController {
    */
   @PostMapping("/{id}/pay")
   @Operation(summary = "Pay for a booking")
-  ResponseEntity<?> pay(@PathVariable UUID id) {
-    return switch (payments.pay(id)) {
+  ResponseEntity<?> pay(@PathVariable UUID id, @AuthenticationPrincipal Jwt token) {
+    return switch (payments.pay(id, Guests.idOf(token))) {
       case PayResult.Confirmed(Booking booking) -> ResponseEntity.ok(BookingResponse.of(booking));
       case PayResult.AlreadyConfirmed(Booking booking) ->
           ResponseEntity.ok(BookingResponse.of(booking));
@@ -109,8 +121,8 @@ class BookingController {
   /** Cancelling an already cancelled booking is the same answer again, not a failure. */
   @PostMapping("/{id}/cancel")
   @Operation(summary = "Cancel a booking")
-  ResponseEntity<?> cancel(@PathVariable UUID id) {
-    return switch (lifecycle.cancel(id)) {
+  ResponseEntity<?> cancel(@PathVariable UUID id, @AuthenticationPrincipal Jwt token) {
+    return switch (lifecycle.cancel(id, Guests.idOf(token))) {
       case CancelResult.Cancelled(Booking booking) ->
           ResponseEntity.ok(BookingResponse.of(booking));
       case CancelResult.AlreadyCancelled(Booking booking) ->
@@ -122,8 +134,8 @@ class BookingController {
 
   @GetMapping("/{id}")
   @Operation(summary = "Read a booking")
-  BookingResponse get(@PathVariable UUID id) {
-    return BookingResponse.of(holds.getBooking(id));
+  BookingResponse get(@PathVariable UUID id, @AuthenticationPrincipal Jwt token) {
+    return BookingResponse.of(holds.getBooking(id, Guests.idOf(token)));
   }
 
   private static ResponseEntity<ProblemDetail> conflict(ProblemDetail problem) {
