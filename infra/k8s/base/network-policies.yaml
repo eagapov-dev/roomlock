@@ -1,0 +1,209 @@
+# WHO MAY TALK TO WHOM. This is the file the other two shapes have no equivalent of.
+#
+# In infra/docker-compose.yml every container can reach every other container by name: one bridge
+# network, no filtering, and the only thing keeping notification-service from being called is that
+# nobody has a reason to. In infra/gcp/run.tf the same statement is made with IAM - internal-only
+# ingress plus exactly one run.invoker binding for payment-service, and no binding at all for
+# notification-service - which is authorisation at the platform layer, checked per request, by
+# identity. Here it is the network layer, checked per packet, by pod label. The three mechanisms are
+# not interchangeable and the difference is worth seeing side by side.
+#
+# HOW THESE OBJECTS WORK, because it is not obvious: a NetworkPolicy is not a firewall rule, it is a
+# membership statement. A pod that no policy selects accepts everything. A pod that *any* policy with
+# `policyTypes: [Ingress]` selects accepts only what the union of those policies allows. So each
+# policy below both restricts its target and enumerates the exceptions, and the restriction comes
+# from the pod being selected at all - not from any deny rule, of which there are none.
+#
+# READ THIS BEFORE BELIEVING THEM: on a stock `kind` cluster these are almost certainly DECORATION.
+# kindnet, kind's default CNI, has historically not enforced NetworkPolicy - the API server accepts
+# the objects, `kubectl get networkpolicy` lists them, and every packet still gets through. To see
+# them enforced, create the cluster with `disableDefaultCNI: true` and install Calico or Cilium
+# (infra/k8s/README.md, known gaps). This is the sharpest example in the whole directory of a
+# manifest being a declaration of intent that some other component has to honour.
+#
+# Two more things these policies do not do:
+#   - No egress rules anywhere. An egress default-deny is the more valuable half in a real cluster,
+#     and it is also where this would stop working in a way that looks like an application bug: every
+#     pod needs UDP 53 to kube-dns in kube-system before it can resolve `postgres`, and a forgotten
+#     allow there shows up as a JDBC timeout. Restricting egress properly is a decision about the
+#     whole cluster's DNS and API-server policy, not about this namespace.
+#   - Nothing here covers the kubelet. Probe traffic and `kubectl port-forward` originate on the node,
+#     not from a pod, so no podSelector or namespaceSelector describes them; CNIs differ in whether
+#     they police host-to-pod traffic at all (Calico and Cilium permit it to local pods by default).
+#     If pods stop passing their probes the moment policies are applied, that is the mechanism to
+#     look at first.
+
+# payment-service accepts gRPC from booking-service and nothing else. Charge and Refund move money,
+# and this is the network half of the two-part argument infra/gcp/run.tf makes: internal-only keeps
+# the internet out, the invoker binding keeps every other workload out. A cluster has no internet
+# edge to keep out - there is no Ingress for this service - so the second half is all of it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payment-service-ingress
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  policyTypes: [Ingress]
+  ingress:
+    # The contract of payment-api, from its one caller.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: booking-service
+      ports:
+        - protocol: TCP
+          port: 9091
+    # The scrape, and only the scrape: the actuator port is open to the Prometheus pod and to nothing
+    # else, not even to booking-service. In the Cloud Run shape the same port is reachable only over
+    # localhost inside the instance, by a collector sidecar. Same conclusion, different mechanism.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8081
+---
+# notification-service accepts no application traffic at all. There is nothing to allow: its input is
+# roomlock.booking-events.v1, which it *fetches* - a consumer opens the connection to the broker, so
+# consuming needs no inbound permission whatsoever. This is the pod whose ingress list could be empty.
+#
+# It is not quite empty, and the exception is worth naming rather than hiding: the scrape. Metrics are
+# not traffic in the sense this file is about, and the Cloud Run shape makes the same exception with a
+# collector sidecar reading localhost:8082 inside an otherwise uninvokable revision. Delete the single
+# rule below and `ingress: []` is the literal "nobody, ever", at the cost of the dashboard going blank
+# for this service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notification-service-ingress
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: notification-service
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8082
+---
+# booking-service is the edge, and the edge still gets a list. Two things may reach it: an ingress
+# controller, and the scrape. Nothing inside the namespace calls it - payment-service and
+# notification-service never call back into booking-service; everything that flows the other way
+# flows through Kafka.
+#
+# The namespaceSelector matches the label the API server puts on every namespace
+# (kubernetes.io/metadata.name), so it does not depend on ingress-nginx labelling itself. If the
+# README's smoke test reaches booking-service by port-forward instead, that traffic comes from the
+# node and this policy has nothing to say about it - see the header.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: booking-service-ingress
+  labels:
+    app.kubernetes.io/name: booking-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: booking-service
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# PostgreSQL accepts connections from the three services and from nobody else. Three databases in one
+# instance means the isolation between them is PostgreSQL's (a role per database owner), not the
+# network's - this policy cannot express "booking-service may only reach the booking database", and
+# nothing in this shape can. What it does express is that a pod which is not one of the three cannot
+# reach 5432 at all, which is the part `kubectl run -it --rm psql` would otherwise disprove.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: roomlock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: booking-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: notification-service
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# Kafka accepts clients from the three services, and the controller port from its own pods only. With
+# one broker the quorum talks to itself, so the second rule is what a second replica would need
+# rather than something this deployment exercises - it is here because leaving 9093 open to the three
+# application pods would say something untrue about who takes part in the quorum.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-ingress
+  labels:
+    app.kubernetes.io/name: kafka
+    app.kubernetes.io/part-of: roomlock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: booking-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: notification-service
+      ports:
+        - protocol: TCP
+          port: 9092
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9093

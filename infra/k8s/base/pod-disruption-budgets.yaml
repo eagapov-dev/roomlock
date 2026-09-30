@@ -1,0 +1,59 @@
+# WHAT MAY BE TAKEN AWAY, AND BY WHOM. A PodDisruptionBudget constrains *voluntary* disruption only -
+# `kubectl drain`, a cluster autoscaler compacting nodes, a node pool upgrade. It has no opinion about
+# a node that catches fire, an OOM kill or a failed probe, and it does not stop a rollout (that is
+# `strategy.rollingUpdate` on each Deployment). Saying this plainly matters, because a budget reads
+# like an availability guarantee and is not one.
+#
+# maxUnavailable: 1 rather than minAvailable: 1 on all three, deliberately. With two replicas the two
+# forms are identical; they stop being identical when someone scales up or down. At five replicas
+# minAvailable: 1 would permit four evictions at once, which is not what anyone meant by "keep it
+# available"; maxUnavailable: 1 keeps a drain to one pod at a time however many there are. And at one
+# replica maxUnavailable: 1 still permits the eviction, where minAvailable: 1 would make
+# `kubectl drain` block forever on a single-replica Deployment - the classic way a budget turns a node
+# upgrade into an incident.
+#
+# NOTHING FOR POSTGRES AND NOTHING FOR KAFKA, and that is the honest statement rather than an omission:
+# one replica each, no replication, so draining that node stops the whole system until the pod comes
+# back with its volume. A budget cannot fix that; replication or a managed service can. infra/gcp
+# buys exactly that, and it is most of the price difference between the two shapes.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: booking-service
+  labels:
+    app.kubernetes.io/name: booking-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: booking-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+---
+# The consumers' budget is about the group, not about requests: evicting both replicas at once would
+# leave roomlock.booking-events.v1 with no member until a pod is rescheduled, and nothing would be
+# notified in the meantime. One at a time means the partitions move to the surviving member.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: notification-service
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notification-service
