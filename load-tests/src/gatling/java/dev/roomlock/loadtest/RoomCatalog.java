@@ -102,11 +102,15 @@ final class RoomCatalog {
     return stay(roomIds.get((int) (slot % rooms)), FIRST_NIGHT.plusDays(slot / rooms));
   }
 
-  /** Session attributes of one hold request: a fresh guest and a fresh idempotency key. */
+  /**
+   * Session attributes of one hold request: the stay and a fresh idempotency key. No guest - every
+   * virtual user of a run is the subject of its one access token, which changes nothing about the
+   * contention being measured: the key is what makes a retry a replay, and an overlapping stay is
+   * decided by the room and the night.
+   */
   private static Map<String, Object> stay(String roomId, LocalDate checkIn) {
     return Map.of(
         "roomId", roomId,
-        "guestId", UUID.randomUUID().toString(),
         "idempotencyKey", UUID.randomUUID().toString(),
         "checkIn", checkIn.toString(),
         "checkOut", checkIn.plusDays(1).toString());

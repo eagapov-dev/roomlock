@@ -19,9 +19,13 @@ final class Holds {
 
   private static final String IDEMPOTENCY_KEY = "Idempotency-Key";
 
+  /**
+   * No guestId: the guest is the subject of the access token of the run, and a body that still
+   * named one would be answered 400 rather than ignored (HoldBookingRequest).
+   */
   private static final String BODY =
       """
-      {"roomId":"#{roomId}","guestId":"#{guestId}",\
+      {"roomId":"#{roomId}",\
       "checkIn":"#{checkIn}","checkOut":"#{checkOut}"}""";
 
   private Holds() {}
