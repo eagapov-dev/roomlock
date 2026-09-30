@@ -367,6 +367,14 @@ about correctness, not about throughput:
   consumers deduplicate on it. Exactly-once is not on offer. Ten replicas buy more of that window, not
   less.
 
+> **This contradicts `infra/gcp/`, and the code is the tie-breaker.** `infra/gcp/run.tf` caps
+> `max_instance_count` at 1 and calls it a correctness cap, on the grounds that "the outbox publisher
+> has no leader election and its pending query takes no lock". That was true before
+> `PublisherLease` existed and it is not true now — the lease landed in
+> `fix(booking): let one instance publish the outbox, and prune what went out`, which is in `main`.
+> The cap itself is still a reasonable default for a deployment that bills per instance; the reason
+> given for it is out of date. `infra/gcp/**` is not this directory's to edit.
+
 payment-service and notification-service run two in `base/` and one in the kind overlay (a laptop).
 A second replica of payment-service is *not* a second charge handler:
 `static://payment-service:9091` plus a ClusterIP is balanced per TCP connection, and gRPC keeps one
