@@ -198,10 +198,10 @@ Cloud Run's default throttles CPU to near zero outside a request. That breaks th
 
 A request-driven service can afford to scale to zero. A scheduler or a consumer cannot.
 
-`max_instance_count` is capped at **1**, and that is also a correctness cap: the outbox publisher has
-no leader election and its pending query takes no lock, so two booking-service replicas would both
-sweep and both publish every event (`docs/reliability.md`, known gaps). The consumers deduplicate on
-`eventId`, so the system stays *correct*, but by accident of the consumers rather than by design.
+`max_instance_count` is capped at **1**, but as a cost default rather than a correctness one: with
+`cpu_idle = false` every instance bills for CPU it never yields. A second replica would be safe —
+the outbox publisher takes a lease so one instance sweeps at a time, and the hold expiry and payment
+reconciliation sweeps claim their batches with `FOR UPDATE SKIP LOCKED` (`docs/reliability.md`).
 
 ### Ingress and who may invoke what
 
@@ -374,7 +374,8 @@ spring:
 Without them every producer and consumer fails to connect, and `SPRING_KAFKA_BOOTSTRAP_SERVERS` being
 correct will not help.
 
-The gRPC ID token (above) is the other half. `Profiles.CLOUD` is declared and unused today
+The gRPC ID token (above) is the other half. `Profiles.CLOUD` now carries a `cloud` document in every
+service's `application.yml`
 (`docs/architecture.md`, known gaps), and a `cloud` profile document is the natural home for both.
 
 The environment variables this directory sets are exactly the property names already in the three

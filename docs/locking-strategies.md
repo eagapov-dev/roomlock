@@ -73,7 +73,9 @@ INSERT booking (HELD) + INSERT outbox_event
 Nothing is locked up front. The version read at the start is used as the guard of the bump: if
 another hold of this room committed in between, the bump matches no row, the attempt rolls back and
 runs again against fresh state (rule DB-8). `maxAttempts` comes from
-`roomlock.locking.max-attempts` (3 by default); `1` disables retrying.
+`roomlock.locking.optimistic.max-attempts` (3 by default); `1` disables retrying. The name is
+scoped on purpose: the other two strategies pass a hard-coded single attempt, because giving them a
+retry loop would change the very behaviour this comparison measures.
 
 `room.version` is a plain column, never a JPA `@Version`, and `RoomRepository.bumpVersion` is the
 only statement that writes it.
@@ -110,7 +112,7 @@ overlap operator; the partial `WHERE` is what makes a cancelled booking stop blo
 | Statements on the happy path | lock, check, insert | read version, check, bump, insert | insert |
 | What closes the window | a row lock held to commit | a conditional version bump | the exclusion constraint |
 | A conflicting request | **waits** on the room row | **retries** the whole attempt | gets a **constraint violation** |
-| Attempts | 1 | `roomlock.locking.max-attempts` | 1 |
+| Attempts | 1 | `roomlock.locking.optimistic.max-attempts` | 1 |
 | Typical conflict outcome | `Busy` (the winner's row is visible by the time the loser reads) | `Contended`, retried; `Busy` once the winner's row is visible | `Busy` |
 | Works without `booking_no_overlap` | yes | yes | **no** |
 | Granularity of the conflict | the room | the room | the room **and** the stay |
@@ -271,8 +273,10 @@ Three things make the comparison fair:
   winner, whatever the strategy. `IdempotentRetrySimulation` asserts that the replay actually
   happened, "otherwise the run proves nothing".
 
-Because the compose file has no hook for `roomlock.locking.strategy`, comparing strategies means
-running booking-service next to the infrastructure — `README.md` has the exact commands, and
+Comparing strategies in the containerised stack takes one variable:
+`ROOMLOCK_LOCKING_STRATEGY=optimistic docker compose -f infra/docker-compose.yml up -d`. Running
+booking-service next to the infrastructure is the other option, and the one to prefer while editing
+code, since it needs no image rebuild — `README.md` has the exact commands. And
 `.github/workflows/load-tests.yml` does the same on a runner with the strategy, user count and
 duration as `workflow_dispatch` inputs, one run per strategy, `concurrency: load-tests` so two runs
 cannot fight over the same ports and database.
@@ -282,10 +286,5 @@ cannot fight over the same ports and database.
 - **No numbers are recorded in the repository.** The scenarios and the dashboard make the three
   strategies comparable, but no measured result is committed anywhere, so this document deliberately
   describes costs qualitatively rather than quoting throughput or latency figures.
-- **`roomlock.locking.max-attempts` applies only to the optimistic strategy.** The other two pass a
-  hard-coded `ATTEMPTS = 1` to the superclass, so raising the property has no effect on them. The
-  javadoc of `LockingProperties` says so, but the property name does not.
-- **The containerised stack always runs `constraint`.** See above; `infra/docker-compose.yml` passes
-  no strategy environment variable to `booking-service`.
 - **The `no-constraint` profile is untested for the API layer.** It is exercised by strategy and
   schema tests only; nothing asserts what `POST /api/v1/bookings` answers under it.
