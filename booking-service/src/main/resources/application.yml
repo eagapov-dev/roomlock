@@ -30,6 +30,22 @@ spring:
     password: roomlock
     hikari:
       maximum-pool-size: 10
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Keycloak of infra/docker-compose.yml, imported from infra/keycloak/roomlock-realm.json.
+          # It is a local convenience only: nothing in infra/gcp or a Kubernetes manifest runs it, and
+          # a real deployment points these two at its own provider (docs/deployment.md).
+          #
+          # Both values, not just one. The keys are fetched from where this process can actually reach
+          # the provider, while the `iss` claim is validated against the URL the *token* was minted
+          # for - and inside compose those are two different addresses for the same Keycloak
+          # (`keycloak:8080` from a container, `localhost:8088` from the host). Setting only
+          # jwk-set-uri would leave `iss` unchecked, and setting only issuer-uri would make a
+          # container fetch the keys through a host port it cannot see.
+          issuer-uri: http://localhost:8088/realms/roomlock
+          jwk-set-uri: http://localhost:8088/realms/roomlock/protocol/openid-connect/certs
   grpc:
     client:
       channels:
@@ -189,6 +205,26 @@ spring:
           # Cloud Run terminates TLS at the edge: the hop is https, and the plaintext default of the
           # local run must not reach this profile.
           negotiation-type: tls
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Which identity provider this deployment trusts. Neither value has a default, the way
+          # DB_PASSWORD and PAYMENT_AUDIENCE have none: an issuer is not something to guess, and a
+          # wrong default would be a service quietly accepting tokens of somebody else's provider.
+          #
+          # Both have to be named here, and not only because the local document above names both:
+          # the documents of this file are merged, so a cloud revision that left jwk-set-uri alone
+          # would inherit the localhost:8088 of a developer's Keycloak and fetch its keys from
+          # nowhere. Overriding it is what keeps the local convenience local.
+          #
+          # Two variables rather than one and OIDC discovery, because the address the keys are
+          # fetched from is a deployment's own business - it may be an internal one - and because a
+          # value that is spelled out cannot be a surprise. Neither is read before the first request
+          # that carries a token, so an unreachable issuer delays 401s and not the rollout
+          # (docs/runbook.md).
+          issuer-uri: ${OIDC_ISSUER_URI}
+          jwk-set-uri: ${OIDC_JWK_SET_URI}
   lifecycle:
     # Cloud Run sends SIGTERM and then waits: let the in-flight requests and the running sweep
     # finish first.
@@ -223,4 +259,5 @@ management:
         enabled: true
   # The exposure list of the default document already publishes health and prometheus and nothing
   # else: /actuator/health for the startup and liveness probes of the revision, /actuator/prometheus
-  # for the Google Managed Prometheus sidecar that scrapes it.
+  # for the Google Managed Prometheus sidecar that scrapes it. Both stay reachable without a token
+  # (ApiSecurityConfig): neither a Cloud Run probe nor the collector sidecar can present one.

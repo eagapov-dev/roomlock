@@ -14,8 +14,10 @@ import dev.roomlock.booking.support.BookingIntegrationTest;
 import dev.roomlock.booking.support.BookingTable;
 import dev.roomlock.booking.support.DatabaseCleaner;
 import dev.roomlock.booking.support.OutboxTable;
+import dev.roomlock.booking.support.TestData.BookingDraft;
 import dev.roomlock.booking.support.TestData.HoldDraft;
 import dev.roomlock.booking.support.TestData.RoomDraft;
+import dev.roomlock.booking.support.TestJwts;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -30,7 +32,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
-/** Cancelling a booking through HTTP and the real database (end-to-end scenario). */
+/**
+ * Cancelling a booking through HTTP and the real database (end-to-end scenario). Every cancel
+ * carries the access token of the guest whose booking it is.
+ */
 @BookingIntegrationTest
 class BookingCancelApiIntegrationTest {
 
@@ -55,10 +60,11 @@ class BookingCancelApiIntegrationTest {
   @Test
   void shouldReportCancelledBookingWhenGuestCancelsOverHttp() throws Exception {
     // given
-    UUID bookingId = hold(aHold().withRoomId(roomId).withStay(november(10), november(13)));
+    HoldDraft draft = aHold().withRoomId(roomId).withStay(november(10), november(13));
+    UUID bookingId = hold(draft);
 
     // when
-    ResponseEntity<String> response = cancel(bookingId);
+    ResponseEntity<String> response = cancel(bookingId, draft.guestId());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -66,19 +72,19 @@ class BookingCancelApiIntegrationTest {
     assertThat(booking.path("id").asText()).isEqualTo(bookingId.toString());
     assertThat(booking.path("status").asText()).isEqualTo("CANCELLED");
     assertThat(booking.path("cancelReason").asText()).isEqualTo("USER_CANCELLED");
-    JsonNode found =
-        json.readTree(rest.getForEntity(BOOKINGS + "/{id}", String.class, bookingId).getBody());
+    JsonNode found = json.readTree(getBooking(bookingId, draft.guestId()).getBody());
     assertThat(found.path("status").asText()).isEqualTo("CANCELLED");
   }
 
   @Test
   void shouldReturnOkAgainWhenCancelIsRepeated() throws Exception {
     // given
-    UUID bookingId = hold(aHold().withRoomId(roomId));
-    assertThat(cancel(bookingId).getStatusCode()).isEqualTo(HttpStatus.OK);
+    HoldDraft draft = aHold().withRoomId(roomId);
+    UUID bookingId = hold(draft);
+    assertThat(cancel(bookingId, draft.guestId()).getStatusCode()).isEqualTo(HttpStatus.OK);
 
     // when
-    ResponseEntity<String> retry = cancel(bookingId);
+    ResponseEntity<String> retry = cancel(bookingId, draft.guestId());
 
     // then
     assertThat(retry.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -89,15 +95,15 @@ class BookingCancelApiIntegrationTest {
   @Test
   void shouldReportCancelledBookingWhenConfirmedStayIsDropped() throws Exception {
     // given
-    UUID bookingId =
-        bookingTable.insert(
-            aBooking()
-                .withRoomId(roomId)
-                .withStay(november(10), november(13))
-                .withStatus(BookingStatus.CONFIRMED));
+    BookingDraft draft =
+        aBooking()
+            .withRoomId(roomId)
+            .withStay(november(10), november(13))
+            .withStatus(BookingStatus.CONFIRMED);
+    UUID bookingId = bookingTable.insert(draft);
 
     // when
-    ResponseEntity<String> response = cancel(bookingId);
+    ResponseEntity<String> response = cancel(bookingId, draft.guestId());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -111,15 +117,15 @@ class BookingCancelApiIntegrationTest {
   @Test
   void shouldReturnConflictWhenBookingIsPaying() throws Exception {
     // given
-    UUID bookingId =
-        bookingTable.insert(
-            aBooking()
-                .withRoomId(roomId)
-                .withStay(november(10), november(13))
-                .withStatus(BookingStatus.PAYING));
+    BookingDraft draft =
+        aBooking()
+            .withRoomId(roomId)
+            .withStay(november(10), november(13))
+            .withStatus(BookingStatus.PAYING);
+    UUID bookingId = bookingTable.insert(draft);
 
     // when
-    ResponseEntity<String> response = cancel(bookingId);
+    ResponseEntity<String> response = cancel(bookingId, draft.guestId());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
@@ -139,7 +145,7 @@ class BookingCancelApiIntegrationTest {
     UUID unknownId = UUID.randomUUID();
 
     // when
-    ResponseEntity<String> response = cancel(unknownId);
+    ResponseEntity<String> response = cancel(unknownId, UUID.randomUUID());
 
     // then
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
@@ -148,8 +154,17 @@ class BookingCancelApiIntegrationTest {
     assertThat(problem.path("resource").asText()).isEqualTo("booking");
   }
 
-  private ResponseEntity<String> cancel(UUID bookingId) {
-    return rest.postForEntity(CANCEL, null, String.class, bookingId);
+  private ResponseEntity<String> cancel(UUID bookingId, UUID guestId) {
+    return rest.exchange(CANCEL, HttpMethod.POST, guestRequest(guestId), String.class, bookingId);
+  }
+
+  private ResponseEntity<String> getBooking(UUID bookingId, UUID guestId) {
+    return rest.exchange(
+        BOOKINGS + "/{id}", HttpMethod.GET, guestRequest(guestId), String.class, bookingId);
+  }
+
+  private static HttpEntity<Void> guestRequest(UUID guestId) {
+    return new HttpEntity<>(TestJwts.bearer(TestJwts.guest(guestId)));
   }
 
   private UUID hold(HoldDraft draft) throws Exception {
@@ -158,8 +173,7 @@ class BookingCancelApiIntegrationTest {
     body.put("guestId", draft.guestId());
     body.put("checkIn", draft.checkIn().toString());
     body.put("checkOut", draft.checkOut().toString());
-    HttpHeaders headers = new HttpHeaders();
-    headers.setContentType(MediaType.APPLICATION_JSON);
+    HttpHeaders headers = TestJwts.jsonBearer(TestJwts.guest(draft.guestId()));
     headers.set(IDEMPOTENCY_KEY, draft.idempotencyKey());
     ResponseEntity<String> created =
         rest.exchange(BOOKINGS, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
@@ -169,21 +183,28 @@ class BookingCancelApiIntegrationTest {
 
   private UUID createRoom() throws Exception {
     ResponseEntity<String> hotel =
-        rest.postForEntity(
+        rest.exchange(
             "/api/v1/hotels",
-            Map.of("name", aHotel().name(), "city", aHotel().city()),
+            HttpMethod.POST,
+            operatorRequest(Map.of("name", aHotel().name(), "city", aHotel().city())),
             String.class);
     UUID hotelId = UUID.fromString(json.readTree(hotel.getBody()).path("id").asText());
     RoomDraft room = aRoom();
     ResponseEntity<String> created =
-        rest.postForEntity(
+        rest.exchange(
             "/api/v1/hotels/{id}/rooms",
-            Map.of(
-                "number", room.number(),
-                "capacity", room.capacity(),
-                "pricePerNight", room.pricePerNight()),
+            HttpMethod.POST,
+            operatorRequest(
+                Map.of(
+                    "number", room.number(),
+                    "capacity", room.capacity(),
+                    "pricePerNight", room.pricePerNight())),
             String.class,
             hotelId);
     return UUID.fromString(json.readTree(created.getBody()).path("id").asText());
+  }
+
+  private static HttpEntity<Object> operatorRequest(Object body) {
+    return new HttpEntity<>(body, TestJwts.jsonBearer(TestJwts.operator()));
   }
 }

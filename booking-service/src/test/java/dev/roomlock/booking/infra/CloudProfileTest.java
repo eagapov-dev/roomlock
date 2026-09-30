@@ -28,6 +28,8 @@ class CloudProfileTest {
     "KAFKA_BOOTSTRAP_SERVERS=bootstrap.roomlock.example.managedkafka:9092",
     "PAYMENT_GRPC_ADDRESS=dns:///payment-service.example.run.app:443",
     "PAYMENT_AUDIENCE=https://payment-service.example.run.app",
+    "OIDC_ISSUER_URI=https://issuer.example.com/realms/roomlock",
+    "OIDC_JWK_SET_URI=https://issuer.example.com/realms/roomlock/protocol/openid-connect/certs",
   };
 
   @Test
@@ -111,6 +113,53 @@ class CloudProfileTest {
 
     // then
     assertThat(audience).isEqualTo("https://payment-service.example.run.app");
+  }
+
+  /**
+   * Which identity provider a revision trusts is a deployment decision, not a default - and both
+   * values have to come from the environment, because the documents of application.yml are merged
+   * and an unset jwk-set-uri would inherit the localhost Keycloak of a local run.
+   */
+  @Test
+  void shouldTakeTheIssuerAndItsKeysFromTheEnvironmentWhenProfileIsCloud() {
+    // given
+    // when
+    String issuer = resolved("spring.security.oauth2.resourceserver.jwt.issuer-uri", ENVIRONMENT);
+    String keys = resolved("spring.security.oauth2.resourceserver.jwt.jwk-set-uri", ENVIRONMENT);
+
+    // then
+    assertThat(issuer).isEqualTo("https://issuer.example.com/realms/roomlock");
+    assertThat(keys)
+        .isEqualTo("https://issuer.example.com/realms/roomlock/protocol/openid-connect/certs")
+        .doesNotContain("localhost");
+  }
+
+  /**
+   * A default would be worse than a failure: it would be a service quietly trusting somebody else's
+   * identity provider. The name is a contract, and a missing one has to be loud.
+   */
+  @Test
+  void shouldRefuseTheIssuerWhenItsVariableIsNotSet() {
+    // given
+    String[] withoutIssuer = {"DB_HOST=10.20.0.3", "DB_NAME=booking", "DB_USER=booking"};
+
+    // when
+    // then
+    assertThatThrownBy(
+            () -> resolved("spring.security.oauth2.resourceserver.jwt.issuer-uri", withoutIssuer))
+        .hasMessageContaining("OIDC_ISSUER_URI");
+  }
+
+  @Test
+  void shouldRefuseTheJwkSetUriWhenItsVariableIsNotSet() {
+    // given
+    String[] withoutKeys = {"OIDC_ISSUER_URI=https://issuer.example.com/realms/roomlock"};
+
+    // when
+    // then
+    assertThatThrownBy(
+            () -> resolved("spring.security.oauth2.resourceserver.jwt.jwk-set-uri", withoutKeys))
+        .hasMessageContaining("OIDC_JWK_SET_URI");
   }
 
   /** Flyway on startup and the two endpoints Cloud Run and Managed Prometheus read. */

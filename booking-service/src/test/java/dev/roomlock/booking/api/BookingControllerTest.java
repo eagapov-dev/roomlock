@@ -9,6 +9,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.roomlock.booking.domain.Booking;
@@ -34,12 +35,13 @@ import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.assertj.MockMvcTester;
 import org.springframework.test.web.servlet.assertj.MvcTestResult;
 
 @WebMvcTest(BookingController.class)
-@Import(Problems.class)
+@Import({Problems.class, ApiSecurityConfig.class})
 class BookingControllerTest {
 
   private static final String BOOKINGS = "/api/v1/bookings";
@@ -50,6 +52,12 @@ class BookingControllerTest {
   @MockitoBean private HoldService holds;
   @MockitoBean private PaymentService payments;
   @MockitoBean private LifecycleService lifecycle;
+
+  /**
+   * The chain of {@link ApiSecurityConfig} needs a decoder to be built; no test here sends a real
+   * token, {@code jwt()} installs the authentication directly.
+   */
+  @MockitoBean private JwtDecoder jwtDecoder;
 
   @Test
   void shouldReturnCreatedWithLocationWhenRoomIsHeld() throws Exception {
@@ -193,6 +201,7 @@ class BookingControllerTest {
     MvcTestResult result =
         mvc.post()
             .uri(BOOKINGS)
+            .with(jwt())
             .contentType(MediaType.APPLICATION_JSON)
             .content(json.writeValueAsString(holdBody(draft)))
             .exchange();
@@ -276,7 +285,8 @@ class BookingControllerTest {
     given(holds.getBooking(booking.getId())).willReturn(booking);
 
     // when
-    MvcTestResult result = mvc.get().uri(BOOKINGS + "/{id}", booking.getId()).exchange();
+    MvcTestResult result =
+        mvc.get().uri(BOOKINGS + "/{id}", booking.getId()).with(jwt()).exchange();
 
     // then
     assertThat(result).hasStatus(HttpStatus.OK);
@@ -292,7 +302,7 @@ class BookingControllerTest {
         .willThrow(new ResourceNotFoundException("booking", unknownId));
 
     // when
-    MvcTestResult result = mvc.get().uri(BOOKINGS + "/{id}", unknownId).exchange();
+    MvcTestResult result = mvc.get().uri(BOOKINGS + "/{id}", unknownId).with(jwt()).exchange();
 
     // then
     assertProblem(result, HttpStatus.NOT_FOUND, "not-found");
@@ -465,11 +475,11 @@ class BookingControllerTest {
   }
 
   private MvcTestResult postPay(UUID bookingId) {
-    return mvc.post().uri(BOOKINGS + "/{id}/pay", bookingId).exchange();
+    return mvc.post().uri(BOOKINGS + "/{id}/pay", bookingId).with(jwt()).exchange();
   }
 
   private MvcTestResult postCancel(UUID bookingId) {
-    return mvc.post().uri(BOOKINGS + "/{id}/cancel", bookingId).exchange();
+    return mvc.post().uri(BOOKINGS + "/{id}/cancel", bookingId).with(jwt()).exchange();
   }
 
   private static Booking bookingOf(HoldDraft draft) {
@@ -488,6 +498,7 @@ class BookingControllerTest {
   private MvcTestResult postBody(String idempotencyKey, Map<String, Object> body) throws Exception {
     return mvc.post()
         .uri(BOOKINGS)
+        .with(jwt())
         .header(IDEMPOTENCY_KEY, idempotencyKey)
         .contentType(MediaType.APPLICATION_JSON)
         .content(json.writeValueAsString(body))

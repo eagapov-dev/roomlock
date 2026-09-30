@@ -18,6 +18,10 @@ import org.springframework.test.context.ActiveProfiles;
  * cached context and one container. Tests are not transactional: isolation comes from {@link
  * DatabaseCleaner#truncateAll()} in {@code @BeforeEach} (rule T-6).
  *
+ * <p>{@link TestSecurityConfig} gives the context a {@code JwtDecoder} of a locally generated key
+ * pair, so the real filter chain runs and {@link TestJwts} mints the tokens it accepts - no
+ * identity provider takes part in any test.
+ *
  * <p>{@code @AutoConfigureObservability} undoes the default of Spring Boot tests, which is to
  * disable metrics export: without it the context gets a {@code SimpleMeterRegistry} and no {@code
  * /actuator/prometheus}, and the meters of the hold flow could not be asserted where they are
@@ -34,7 +38,8 @@ import org.springframework.test.context.ActiveProfiles;
   DatabaseCleaner.class,
   BookingTable.class,
   OutboxTable.class,
-  StubPaymentGateway.class
+  StubPaymentGateway.class,
+  TestSecurityConfig.class
 })
 @ActiveProfiles(Profiles.TEST)
 public @interface BookingIntegrationTest {}

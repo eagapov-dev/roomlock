@@ -10,6 +10,7 @@ import dev.roomlock.booking.support.BookingIntegrationTest;
 import dev.roomlock.booking.support.DatabaseCleaner;
 import dev.roomlock.booking.support.TestData.HotelDraft;
 import dev.roomlock.booking.support.TestData.RoomDraft;
+import dev.roomlock.booking.support.TestJwts;
 import java.math.BigDecimal;
 import java.util.Map;
 import java.util.UUID;
@@ -17,11 +18,17 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
-/** Catalog through HTTP and the real database (task 1.4, end-to-end scenario). */
+/**
+ * Catalog through HTTP and the real database (task 1.4, end-to-end scenario). Writing it is an
+ * operator action and carries the {@code catalog:write} scope; reading it is open, so the two GETs
+ * below deliberately send no token at all.
+ */
 @BookingIntegrationTest
 class CatalogApiIntegrationTest {
 
@@ -105,9 +112,9 @@ class CatalogApiIntegrationTest {
   }
 
   private UUID createHotel(HotelDraft hotel) throws Exception {
+    Map<String, Object> body = Map.of("name", hotel.name(), "city", hotel.city());
     ResponseEntity<String> response =
-        rest.postForEntity(
-            "/api/v1/hotels", Map.of("name", hotel.name(), "city", hotel.city()), String.class);
+        rest.exchange("/api/v1/hotels", HttpMethod.POST, operatorRequest(body), String.class);
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CREATED);
     return UUID.fromString(json.readTree(response.getBody()).path("id").asText());
   }
@@ -118,6 +125,11 @@ class CatalogApiIntegrationTest {
             "number", room.number(),
             "capacity", room.capacity(),
             "pricePerNight", room.pricePerNight());
-    return rest.postForEntity("/api/v1/hotels/{id}/rooms", body, String.class, hotelId);
+    return rest.exchange(
+        "/api/v1/hotels/{id}/rooms", HttpMethod.POST, operatorRequest(body), String.class, hotelId);
+  }
+
+  private static HttpEntity<Object> operatorRequest(Object body) {
+    return new HttpEntity<>(body, TestJwts.jsonBearer(TestJwts.operator()));
   }
 }

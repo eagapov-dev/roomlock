@@ -12,6 +12,7 @@ import dev.roomlock.booking.support.BookingIntegrationTest;
 import dev.roomlock.booking.support.DatabaseCleaner;
 import dev.roomlock.booking.support.TestData.HoldDraft;
 import dev.roomlock.booking.support.TestData.RoomDraft;
+import dev.roomlock.booking.support.TestJwts;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -26,7 +27,11 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 
-/** Holding a room through HTTP and the real database (task 2.3, end-to-end scenario). */
+/**
+ * Holding a room through HTTP and the real database (task 2.3, end-to-end scenario). Every request
+ * under {@code /api/v1/bookings} carries the access token of its guest; the room is created with an
+ * operator token, because writing the catalog is not a guest action.
+ */
 @BookingIntegrationTest
 class BookingApiIntegrationTest {
 
@@ -56,7 +61,7 @@ class BookingApiIntegrationTest {
     // then
     assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
     UUID bookingId = UUID.fromString(json.readTree(created.getBody()).path("id").asText());
-    ResponseEntity<String> found = rest.getForEntity(BOOKINGS + "/{id}", String.class, bookingId);
+    ResponseEntity<String> found = getBooking(bookingId, draft.guestId());
     assertThat(found.getStatusCode()).isEqualTo(HttpStatus.OK);
     JsonNode booking = json.readTree(found.getBody());
     assertThat(booking.path("roomId").asText()).isEqualTo(roomId.toString());
@@ -124,29 +129,40 @@ class BookingApiIntegrationTest {
     body.put("guestId", draft.guestId());
     body.put("checkIn", draft.checkIn().toString());
     body.put("checkOut", draft.checkOut().toString());
-    HttpHeaders headers = new HttpHeaders();
-    headers.setContentType(MediaType.APPLICATION_JSON);
+    HttpHeaders headers = TestJwts.jsonBearer(TestJwts.guest(draft.guestId()));
     headers.set(IDEMPOTENCY_KEY, draft.idempotencyKey());
     return rest.exchange(BOOKINGS, HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
   }
 
+  private ResponseEntity<String> getBooking(UUID bookingId, UUID guestId) {
+    HttpEntity<Void> request = new HttpEntity<>(TestJwts.bearer(TestJwts.guest(guestId)));
+    return rest.exchange(BOOKINGS + "/{id}", HttpMethod.GET, request, String.class, bookingId);
+  }
+
   private UUID createRoom() throws Exception {
     ResponseEntity<String> hotel =
-        rest.postForEntity(
+        rest.exchange(
             "/api/v1/hotels",
-            Map.of("name", aHotel().name(), "city", aHotel().city()),
+            HttpMethod.POST,
+            operatorRequest(Map.of("name", aHotel().name(), "city", aHotel().city())),
             String.class);
     UUID hotelId = UUID.fromString(json.readTree(hotel.getBody()).path("id").asText());
     RoomDraft room = aRoom();
     ResponseEntity<String> created =
-        rest.postForEntity(
+        rest.exchange(
             "/api/v1/hotels/{id}/rooms",
-            Map.of(
-                "number", room.number(),
-                "capacity", room.capacity(),
-                "pricePerNight", room.pricePerNight()),
+            HttpMethod.POST,
+            operatorRequest(
+                Map.of(
+                    "number", room.number(),
+                    "capacity", room.capacity(),
+                    "pricePerNight", room.pricePerNight())),
             String.class,
             hotelId);
     return UUID.fromString(json.readTree(created.getBody()).path("id").asText());
+  }
+
+  private static HttpEntity<Object> operatorRequest(Object body) {
+    return new HttpEntity<>(body, TestJwts.jsonBearer(TestJwts.operator()));
   }
 }

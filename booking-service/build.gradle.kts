@@ -12,6 +12,11 @@ dependencies {
   implementation(libs.spring.boot.starter.data.jpa)
   implementation(libs.spring.boot.starter.validation)
   implementation(libs.springdoc.openapi.starter.webmvc.ui)
+  // The only public HTTP surface of the system, so the only module that gets a filter chain: this
+  // service validates the guest's access token itself (rule SP-9 style, see docs/architecture.md).
+  // payment-service and notification-service deliberately stay without one - neither serves a public
+  // HTTP API, the gRPC edge is protected by IAM and an ID token, and Kafka is internal.
+  implementation(libs.spring.boot.starter.oauth2.resource.server)
   implementation(libs.spring.kafka)
   implementation(libs.flyway.core)
   // The ID token a Charge carries under the `cloud` profile (CloudRunAuthInterceptor).
@@ -31,6 +36,11 @@ dependencies {
   // repository, which this build does not declare and the handler does not need.
   runtimeOnly(libs.managed.kafka.auth.login.handler) { exclude(group = "io.confluent") }
 
+  // Tests must not need an identity provider: spring-security-test authenticates a slice request,
+  // and Nimbus signs a real RS256 token for the integration tests against a key pair generated in
+  // the JVM (TestJwts).
+  testImplementation(libs.spring.security.test)
+  testImplementation(libs.nimbus.jose.jwt)
   testImplementation(libs.spring.boot.testcontainers)
   testImplementation(libs.testcontainers.junit.jupiter)
   testImplementation(libs.testcontainers.postgresql)
