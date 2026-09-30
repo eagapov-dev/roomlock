@@ -34,8 +34,7 @@ public class PaymentService {
   private final PaymentMetrics metrics;
   private final Clock clock;
 
-  public PaymentService(
-      PaymentRepository payments, ChargeRule rule, PaymentMetrics metrics, Clock clock) {
+  PaymentService(PaymentRepository payments, ChargeRule rule, PaymentMetrics metrics, Clock clock) {
     this.payments = payments;
     this.rule = rule;
     this.metrics = metrics;

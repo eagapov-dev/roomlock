@@ -18,7 +18,7 @@ import org.springframework.stereotype.Component;
  * to draw from the first scrape instead of a gap until the first charge of that kind.
  */
 @Component
-public class PaymentMetrics {
+class PaymentMetrics {
 
   /** Charges by what the service answered; the rate of this counter is the charge throughput. */
   static final String CHARGES = "roomlock.payment.charges";
@@ -35,7 +35,7 @@ public class PaymentMetrics {
   private final Map<RefundOutcome, Counter> refunds;
   private final Timer duration;
 
-  public PaymentMetrics(MeterRegistry registry) {
+  PaymentMetrics(MeterRegistry registry) {
     this.charges =
         counters(registry, ChargeOutcome.values(), CHARGES, "Charges by what the service answered");
     this.refunds =
