@@ -6,7 +6,8 @@ constraint, a conditional `UPDATE`, or a sweep that finishes what a crash interr
 
 Companion documents: [architecture](architecture.md), [locking strategies](locking-strategies.md),
 [runbook](runbook.md) for the procedures an on-call person runs against these mechanisms, and
-[deployment](deployment.md) for the Google Cloud deployment the last section summarises.
+[deployment](deployment.md) for the Google Cloud deployment
+[one section below](#what-changes-in-the-cloud) summarises.
 
 | Failure | Defence | Where |
 | --- | --- | --- |
