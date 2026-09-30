@@ -11,18 +11,18 @@ import org.springframework.stereotype.Component;
  * same way to everything, and {@code THRESHOLD} answers by the amount alone.
  */
 @Component
-public class ChargeRule {
+class ChargeRule {
 
   private final DecisionMode mode;
   private final long declineAboveMinor;
 
-  public ChargeRule(PaymentProperties properties) {
+  ChargeRule(PaymentProperties properties) {
     this.mode = properties.decision().mode();
     this.declineAboveMinor = properties.decision().declineAboveMinor();
   }
 
   /** The decision for the charge; the same command always decides the same way. */
-  public ChargeDecision decide(ChargeCommand command) {
+  ChargeDecision decide(ChargeCommand command) {
     return switch (mode) {
       case APPROVE_ALL -> ChargeDecision.approve();
       case DECLINE_ALL ->

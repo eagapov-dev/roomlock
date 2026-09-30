@@ -1,7 +1,7 @@
 package dev.roomlock.payment.payments;
 
 /** How the stubbed acquirer of {@link ChargeRule} decides, from {@code application.yml}. */
-public enum DecisionMode {
+enum DecisionMode {
   /** Every charge is approved, whatever it asks for. */
   APPROVE_ALL,
 

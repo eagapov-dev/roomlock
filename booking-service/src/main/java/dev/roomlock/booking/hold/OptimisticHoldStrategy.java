@@ -27,7 +27,7 @@ class OptimisticHoldStrategy extends TransactionalHoldStrategy {
       BookingRepository bookings,
       BookingOutbox outbox,
       LockingProperties properties) {
-    super(transactionManager, metrics, properties.maxAttempts());
+    super(transactionManager, metrics, properties.optimistic().maxAttempts());
     this.rooms = rooms;
     this.bookings = bookings;
     this.outbox = outbox;
