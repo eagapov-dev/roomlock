@@ -44,6 +44,15 @@ micrometer-registry-prometheus = { module = "io.micrometer:micrometer-registry-p
 # OpenAPI document and Swagger UI (this release is built against the Spring Boot version above).
 springdoc-openapi-starter-webmvc-ui = { module = "org.springdoc:springdoc-openapi-starter-webmvc-ui", version.ref = "springdoc" }
 
+# OAuth2 resource server: the filter chain, and the JOSE stack that validates an RS256 access token
+# against the JWK set of the issuer. It pulls spring-boot-starter-security with it, so a module that
+# declares this one gets the whole chain. Nothing here issues a token - minting belongs to the
+# identity provider (docs/architecture.md, authentication).
+spring-boot-starter-oauth2-resource-server = { module = "org.springframework.boot:spring-boot-starter-oauth2-resource-server" }
+# Signing a token in a test. Already a transitive of the starter above; declared because tests
+# compile against it, and a compile dependency of ours is not something to inherit by accident.
+nimbus-jose-jwt = { module = "com.nimbusds:nimbus-jose-jwt" }
+
 # Messaging (versions from the Spring Boot BOM)
 spring-kafka = { module = "org.springframework.kafka:spring-kafka" }
 # The SASL/OAUTHBEARER login callback handler of Google Managed Service for Apache Kafka: the class
@@ -77,6 +86,9 @@ spring-grpc-test = { module = "org.springframework.grpc:spring-grpc-test", versi
 
 # Tests (versions from the Spring Boot BOM)
 spring-boot-starter-test = { module = "org.springframework.boot:spring-boot-starter-test" }
+# The jwt() request post-processor of a slice test and the SecurityContext it installs, so a test
+# needs no identity provider to be authenticated (docs/architecture.md, authentication).
+spring-security-test = { module = "org.springframework.security:spring-security-test" }
 spring-boot-testcontainers = { module = "org.springframework.boot:spring-boot-testcontainers" }
 testcontainers-junit-jupiter = { module = "org.testcontainers:junit-jupiter" }
 testcontainers-postgresql = { module = "org.testcontainers:postgresql" }
