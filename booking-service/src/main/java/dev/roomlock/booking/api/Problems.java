@@ -174,6 +174,23 @@ final class Problems {
   }
 
   /** Nothing about the failure reaches the client (rule E-2): the cause is logged instead. */
+  /**
+   * The service could not get to its database in time - the connection pool is full, or the
+   * database is unreachable. Nothing was decided, so the client may retry: that makes it a 503
+   * rather than the 500 an unhandled failure gets, and the difference matters to whoever reads the
+   * dashboard.
+   */
+  ProblemDetail overloaded() {
+    ProblemDetail problem =
+        problem(
+            HttpStatus.SERVICE_UNAVAILABLE,
+            "overloaded",
+            "Overloaded",
+            "The service is busy and could not handle this request. Please retry.");
+    problem.setProperty("retryable", true);
+    return problem;
+  }
+
   ProblemDetail internalError() {
     return problem(
         HttpStatus.INTERNAL_SERVER_ERROR,

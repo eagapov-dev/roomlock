@@ -37,6 +37,11 @@ spring:
     password: roomlock
     hikari:
       maximum-pool-size: 10
+      # Fail fast when every connection is out rather than queueing for the 30s default: under
+      # contention a hold that waits half a minute for a connection is worth nothing to the caller,
+      # and answering 503 immediately is both truer and cheaper (ApiExceptionHandler).
+      # Milliseconds, not a duration: HikariConfig takes a long, so "2s" fails to bind.
+      connection-timeout: 2000
   security:
     oauth2:
       resourceserver:

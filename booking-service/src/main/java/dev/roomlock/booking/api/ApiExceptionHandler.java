@@ -9,8 +9,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.MessageSourceResolvable;
 import org.springframework.core.MethodParameter;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.validation.FieldError;
 import org.springframework.validation.method.ParameterValidationResult;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -27,6 +32,9 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 class ApiExceptionHandler {
 
   private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
+
+  /** Long enough for a saturated pool to drain, short enough that a client actually retries. */
+  private static final int RETRY_AFTER_SECONDS = 2;
 
   private final Problems problems;
 
@@ -103,6 +111,24 @@ class ApiExceptionHandler {
   @ExceptionHandler(AsyncRequestNotUsableException.class)
   void onClientGone(AsyncRequestNotUsableException exception) {
     log.debug("Client went away before the response was written", exception);
+  }
+
+  /**
+   * The database could not be reached in time: the pool handed out every connection it has, or the
+   * database itself is away. Under contention this is the shape saturation takes - a hold waits for
+   * a connection while the holder of one waits for PostgreSQL to notice a deadlock - and answering
+   * 500 called the client's own load an internal error. Nothing was written, so the honest answer
+   * is 503 with a hint to come back.
+   */
+  @ExceptionHandler({
+    CannotCreateTransactionException.class,
+    DataAccessResourceFailureException.class
+  })
+  ResponseEntity<ProblemDetail> onDatabaseUnreachable(Exception exception) {
+    log.warn("Could not reach the database, answering 503", exception);
+    return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+        .header(HttpHeaders.RETRY_AFTER, String.valueOf(RETRY_AFTER_SECONDS))
+        .body(problems.overloaded());
   }
 
   @ExceptionHandler(Exception.class)
