@@ -281,10 +281,99 @@ code, since it needs no image rebuild — `README.md` has the exact commands. An
 duration as `workflow_dispatch` inputs, one run per strategy, `concurrency: load-tests` so two runs
 cannot fight over the same ports and database.
 
+## Measured
+
+One run of each strategy against the compose stack, same machine, same parameters, nothing else
+running. **Read the method and the caveats below before quoting any of these numbers**: they compare
+the three strategies against each other under identical conditions, and they say nothing about what
+this application would do on real hardware.
+
+### Contention — thirty users, one room, one night
+
+Every user holds the same room for the same night at the same moment
+(`ContentionSimulation`, `-Droomlock.users=30`). Exactly one may win.
+
+| | Pessimistic | Optimistic | Constraint |
+| --- | --- | --- | --- |
+| Held | 1 | 1 | 1 |
+| `409 room-busy` | 29 | 29 | 0 |
+| `409 room-contended` | 0 | 0 | 13 |
+| `503 overloaded` | 0 | 0 | **16** |
+| Mean | 433 ms | 451 ms | 2 919 ms |
+| p95 | 705 ms | 787 ms | **12 513 ms** |
+| p99 | 2 417 ms | 798 ms | 13 631 ms |
+| Throughput | 10.4 rps | 17.3 rps | 3.1 rps |
+
+### Throughput — thirty users, twenty rooms, non-overlapping stays
+
+Each user holds a stay nobody else asked for (`ThroughputSimulation`,
+`-Droomlock.users=30 -Droomlock.duration=30 -Droomlock.rooms=20`), so conflicts are incidental.
+
+| | Pessimistic | Optimistic | Constraint |
+| --- | --- | --- | --- |
+| Holds in 30 s | 3 687 | 3 888 | **5 218** |
+| Throughput | 109 rps | 115 rps | **159 rps** |
+| Mean | 240 ms | 227 ms | 169 ms |
+| p95 | 578 ms | 535 ms | 404 ms |
+| p99 | 853 ms | 774 ms | 645 ms |
+| Retries (`roomlock.hold.retries`) | 0 | 351 | 0 |
+
+### What the numbers say
+
+**The trade-off reverses between the two regimes, and the reversal is large.**
+
+Without conflict the exclusion constraint wins by a wide margin — 159 requests per second against
+109, a p95 of 404 ms against 578 ms. It does one statement where the other two do three, and that
+saving is the whole difference. This is the case the naive intuition gets right.
+
+Under contention it collapses, and the mechanism is worth understanding because it is not obvious:
+thirty concurrent inserts of the same `(room, stay)` do not politely receive `23P01` one after
+another. They wait on each other, and PostgreSQL resolves the tangle through **deadlock detection**,
+which by default does not even look until `deadlock_timeout` — one second — has passed. Every one of
+those waits occupies a database connection. With a pool of ten, sixteen of the thirty requests never
+got a connection at all and were shed as `503`; the ones that did were answered after twelve seconds
+at the 95th percentile. Compare: 13 of the conflicts surfaced as `room-contended`, which is the
+40P01 deadlock translated (`TransactionalHoldStrategy`), and **none** as a plain `room-busy`.
+
+The two application-level strategies never reach that state, because they *ask first*. A pre-check
+that finds the room taken costs one index lookup and answers in under a second — a wasted round trip
+on the happy path, and the thing that saves the service on the unhappy one.
+
+Optimistic paid its own predictable price in the conflict-free run: **351 retries for 3 888 holds**,
+about nine percent, because thirty users shared twenty rooms and the version counter is per room, not
+per stay. Two holds of different nights in the same room contend for the same counter. It still came
+out ahead of pessimistic, because a retry is cheaper than a lock held across a round trip.
+
+### Method, and why these numbers are not benchmarks
+
+- One laptop, everything in Docker on it: PostgreSQL, Kafka, Keycloak, Prometheus, Grafana and all
+  three services, competing for the same cores. The load generator too.
+- One run per cell, no warm-up discarded, no repetitions, no confidence intervals. A second run moves
+  these figures by tens of percent; what it does not move is the shape — the ordering and the order of
+  magnitude between strategies held across every run taken while writing this.
+- `spring.datasource.hikari.maximum-pool-size: 10` and PostgreSQL's default `deadlock_timeout: 1s`.
+  Both are load-bearing for the contention result: a larger pool moves where saturation starts, a
+  shorter deadlock timeout moves how long each conflict occupies a connection.
+- Thirty users on one room and one night is a deliberate extreme. Real traffic spreads across rooms
+  and dates, which is what the throughput table measures.
+- All users authenticate as the same guest, since the load test exchanges one token per run. The hold
+  key is per user and the overlap is per room and night, so this changes nothing measured.
+- Reproduce with `ROOMLOCK_LOCKING_STRATEGY=<strategy> docker compose -f infra/docker-compose.yml up
+  -d` and the two `gatlingRun` commands above; `README.md` has the full invocation.
+
+### What to take from it
+
+If a room is contended by dozens of simultaneous requests, do not let the database be the *only*
+thing that notices. Keep `booking_no_overlap` — it is what makes any of this correct, and the
+`no-constraint` profile exists to prove the application-level strategies can stand without it — but
+answer the common case in the application, where a conflict costs a lookup instead of a deadlock.
+
 ## Known gaps
 
-- **No numbers are recorded in the repository.** The scenarios and the dashboard make the three
-  strategies comparable, but no measured result is committed anywhere, so this document deliberately
-  describes costs qualitatively rather than quoting throughput or latency figures.
+- **The numbers above are one run each on a laptop.** No repetitions, no isolation, no confidence
+  intervals — see [Method](#method-and-why-these-numbers-are-not-benchmarks). They are strong enough
+  to compare the three strategies and far too weak to quote as the performance of anything.
+- **Nothing measures the sweeps under load.** Hold expiry, outbox publishing and payment
+  reconciliation all run during these runs and none of them is measured separately.
 - **The `no-constraint` profile is untested for the API layer.** It is exercised by strategy and
   schema tests only; nothing asserts what `POST /api/v1/bookings` answers under it.
