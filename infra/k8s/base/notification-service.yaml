@@ -1,0 +1,166 @@
+# notification-service: a Kafka consumer with no API. Nothing calls it, and in the Cloud Run shape
+# that is stated by there being no run.invoker binding for it anywhere in infra/gcp/iam.tf. Here it is
+# stated by network-policies.yaml.
+#
+# THIS IS THE SERVICE THAT SHOWS WHAT A POD GIVES YOU. On Cloud Run it needs min_instance_count = 1
+# and cpu_idle = false, because its input is a Kafka record and not an HTTP request: a scaled-to-zero
+# revision would never be woken by anything, and a throttled one would stop polling between requests
+# that never come. Both settings are a fight against a platform whose unit is a request. A pod has no
+# such default - it runs until something stops it, and a consumer that polls is simply a process that
+# runs. There is nothing to configure here, which is the interesting part.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notification-service-config
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/part-of: roomlock
+data:
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/notification
+  SPRING_DATASOURCE_USERNAME: roomlock
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  SERVER_SHUTDOWN: graceful
+  SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 20s
+---
+# A Service for a thing nobody calls, kept for two honest reasons: `kubectl get svc -n roomlock` then
+# describes the whole topology rather than two thirds of it, and it is the address a human uses to
+# port-forward the actuator when a notification did not arrive. The Prometheus scrape does not use it
+# (it discovers pods, not Services), and no application traffic does either.
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: notification-service
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  labels:
+    app.kubernetes.io/name: notification-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  # Two replicas. BookingEventsListener is a consumer in group `notification-service`, so the three
+  # partitions of roomlock.booking-events.v1 are split between the members and no event is handled
+  # twice by design; the notification table is what keeps a guest from being told twice when a
+  # rebalance replays one.
+  #
+  # THREE IS THE CEILING, for the same reason as payment-service: three partitions, so a fourth
+  # replica is assigned no partitions and idles. If someone reaches for `--replicas=5` because
+  # notifications are behind, the fix is partitions, not pods - and re-partitioning changes the
+  # key-to-partition mapping, so ordering guarantees only hold for keys written afterwards.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: notification-service
+  strategy:
+    rollingUpdate:
+      # Unlike the other two: there is no front door to keep open, and each rolling step triggers a
+      # consumer group rebalance. Replacing one pod at a time (down first, then up) means one
+      # rebalance per step instead of two.
+      maxUnavailable: 1
+      maxSurge: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: notification-service
+        app.kubernetes.io/part-of: roomlock
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8082"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      serviceAccountName: notification-service
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: notification-service
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: notification-service
+          image: roomlock/notification-service:dev
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 8082
+          envFrom:
+            - configMapRef:
+                name: notification-service-config
+          env:
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: roomlock-db
+                  key: app-password
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          # Readiness on a service with no callers is not pointless: it is what the rollout waits for
+          # before it replaces the next pod, and what `kubectl rollout status` reports. It says
+          # nothing about whether the consumer is keeping up - consumer lag is a metric, not a probe.
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              # Not about draining requests here - there are none. It gives the listener container a
+              # moment to finish the record it is holding before the context starts closing, so the
+              # partition is handed back cleanly instead of after a session timeout.
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 448Mi
+            limits:
+              cpu: "1"
+              memory: 896Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,225 @@
+# booking-service: the HTTP API, the transactional outbox publisher, and the two sweeps.
+#
+# Every key below is a property that already exists in
+# booking-service/src/main/resources/application.yml, overridden through Spring's relaxed binding -
+# the same mechanism infra/docker-compose.yml and infra/gcp/run.tf use. Nothing invents a property,
+# and the `cloud` profile is deliberately not activated: it is written for Cloud Run (Cloud SQL
+# hostnames, SASL_SSL to Managed Kafka, TLS to a gRPC endpoint on 443) and every one of those
+# statements is false in a cluster.
+#
+# A literal ConfigMap rather than a kustomize configMapGenerator, which would append a content hash
+# to the name and so roll the Deployment automatically on any change. The trade is deliberate: this
+# file is meant to be read and commented, and `kubectl rollout restart deployment/booking-service`
+# after editing it is a smaller cost than moving the configuration into kustomization.yaml where the
+# comments cannot go.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: booking-service-config
+  labels:
+    app.kubernetes.io/name: booking-service
+    app.kubernetes.io/part-of: roomlock
+data:
+  # `postgres` and `kafka` are the headless Services of this namespace; the pods resolve them by
+  # short name because they share it.
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/booking
+  SPRING_DATASOURCE_USERNAME: roomlock
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  # The payment contract over gRPC, plaintext - nothing between the two pods terminates TLS, exactly
+  # as in the compose network and unlike Cloud Run, where the platform's frontend forces tls on 443.
+  # `static://` resolves the name once when the channel is built, which is sound against a ClusterIP
+  # (it does not move for the life of the Service) and is the reason a second payment-service replica
+  # does not share the call load - see payment-service.yaml.
+  SPRING_GRPC_CLIENT_CHANNELS_PAYMENT_ADDRESS: static://payment-service:9091
+  # /actuator/health/readiness and /actuator/health/liveness only exist when the probe groups are on.
+  # Spring Boot turns them on by itself when it detects Kubernetes (KUBERNETES_SERVICE_HOST in the
+  # environment), so this line is redundant - and it is here anyway, because the probes below fail
+  # closed on a 404 and "it worked by auto-detection" is not a thing to discover during a rollout.
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  # The `cloud` profile sets both of these and the default document does not, so without them a pod
+  # being replaced would drop the requests and the sweep it had in flight. A deleted pod gets
+  # SIGTERM; graceful shutdown is what makes the JVM finish what it holds first.
+  SERVER_SHUTDOWN: graceful
+  SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 20s
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: booking-service
+  labels:
+    app.kubernetes.io/name: booking-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: booking-service
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-service
+  labels:
+    app.kubernetes.io/name: booking-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  # TWO REPLICAS, AND THIS IS THE ONE DEPLOYMENT WHERE THAT IS A CLAIM ABOUT CORRECTNESS.
+  #
+  # What makes it safe:
+  #   - The outbox publisher takes a lease. OutboxPublisher.publishBatch() calls
+  #     PublisherLease.heldBy() and returns 0 if another instance holds it; the lease is one row
+  #     upserted with a conditional ON CONFLICT (holder matches, or the lease has expired), renewed
+  #     every sweep, and `roomlock.outbox.lease` is PT30S against a PT1S sweep. So one instance
+  #     publishes and the other skips - which is what keeps the per-booking ordering the contract
+  #     promises, since two instances publishing the same rows cannot promise any order.
+  #   - The hold-expiry sweep and the payment reconciliation sweep claim their batches with
+  #     FOR UPDATE SKIP LOCKED inside a CTE (BookingRepository.expireHolds, and the PAYING lease that
+  #     re-stamps payment_started_at). Two instances sweeping at once take disjoint batches; neither
+  #     waits, and the conditional `WHERE status = ...` of each UPDATE is the real guard.
+  #   - Both writes that matter are conditional transitions, so a lost race changes nothing.
+  #
+  # WHAT THE LEASE DOES NOT PROMISE - and its own javadoc says so: it bounds the window in which two
+  # instances can both publish, it does not close it. An instance that stalls (a long GC, a paused
+  # node) past its lease expiry may still be inside a send when the next instance takes over, and the
+  # duplicate that produces reaches the topic. That is survivable, not invisible: every event carries
+  # an id and both consumers deduplicate on it. Exactly-once is not on offer here, and a reader who
+  # scales this to ten replicas should know they are buying more of that window, not less.
+  #
+  # Note also what this is *not*: booking-service is not a Kafka consumer, so the three-partition cap
+  # that limits the other two Deployments does not apply to it. Its ceiling is the database.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: booking-service
+  strategy:
+    rollingUpdate:
+      # Never below the declared replica count during a rollout: the API is the front door, and a
+      # surge pod costs a few hundred MB for a minute.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: booking-service
+        app.kubernetes.io/part-of: roomlock
+      annotations:
+        # Read by the Prometheus pod's own service discovery (prometheus.yaml), not by Kubernetes.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      serviceAccountName: booking-service
+      automountServiceAccountToken: false
+      # Soft, not required: a kind cluster is one node, and a hard constraint would leave the second
+      # replica Pending forever. On a real cluster this is what stops both replicas sharing a node,
+      # which is most of what the PodDisruptionBudget is protecting.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: booking-service
+      securityContext:
+        # Jib's base image (eclipse-temurin:21-jre) has no USER, so the default would be root. The
+        # application only ever reads its own layers, which Jib makes world-readable, so any uid
+        # works; 1000 is arbitrary and that is the point.
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Long enough for graceful shutdown (SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE, 20s) plus the
+      # preStop pause below. Shorter, and the kubelet SIGKILLs a JVM that was finishing a sweep.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: booking-service
+          # Built by Jib into the local Docker daemon and side-loaded into the node with
+          # `kind load docker-image`; there is no registry in this shape. IfNotPresent so the kubelet
+          # never tries to pull a tag that exists nowhere.
+          image: roomlock/booking-service:dev
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # The JVM needs a writable temp directory (Tomcat's work directory lives under
+            # java.io.tmpdir), so /tmp is an emptyDir and everything else is immutable.
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: booking-service-config
+          env:
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: roomlock-db
+                  key: app-password
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # THE PROBES. All three are needed and they answer three different questions.
+          #
+          # startupProbe: "has it finished booting?" Flyway runs two migration locations against a
+          # cold PostgreSQL and Hibernate then validates the schema, all before the web server starts
+          # accepting - so nothing answers at all for a while. failureThreshold x periodSeconds is the
+          # budget (30 x 5s = 150s), and while it is running the liveness probe is suspended, which is
+          # the whole reason to have it: a slow start must not look like a hung process.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          # readinessProbe: "should this pod be in the Service's endpoints?" The readiness group is
+          # Spring's readinessState and nothing else - deliberately not the database. A pod that
+          # cannot reach PostgreSQL is not a pod worth removing from the load balancer, because every
+          # other pod has the same problem and removing them all turns a degraded API into no API.
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # livenessProbe: "should the kubelet kill this container?" The liveness group only, for the
+          # same reason the Cloud Run definition gives: a database that is briefly away must not
+          # restart the JVM. failureThreshold 6 at 20s means a minute of silence before a restart.
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              # Endpoint removal and SIGTERM are concurrent, not ordered: kube-proxy on some node may
+              # still be sending new requests to this pod when the JVM has already started shutting
+              # down. A few seconds of doing nothing lets the endpoint update win the race.
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          # The memory limit is also the heap setting: Jib builds these images with
+          # -XX:MaxRAMPercentage=75, so the JVM sizes itself from the cgroup and a limit change is a
+          # heap change. The CPU limit is a throttle and is set anyway, so one service's warm-up
+          # cannot starve the node on a laptop; a production cluster would likely drop it and keep
+          # only the request.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}
