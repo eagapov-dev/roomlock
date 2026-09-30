@@ -98,10 +98,12 @@ spring:
       # why it is smaller than the 10 of a local run.
       maximum-pool-size: ${DB_POOL_SIZE:5}
       # A record whose handler cannot get a connection fails and is retried rather than waiting.
-      connection-timeout: 5s
+      # Milliseconds, not a duration: HikariConfig takes a long, so "5s" fails to bind and the
+      # revision never starts.
+      connection-timeout: 5000
       # Cloud SQL maintenance moves the primary: a pool that retires connections notices the move
       # once instead of handing out a wall of broken ones.
-      max-lifetime: 30m
+      max-lifetime: 1800000
   flyway:
     # Migrations keep running at startup. Flyway locks its history table before it migrates, so of
     # several instances starting at once exactly one migrates and the rest wait and then find nothing
