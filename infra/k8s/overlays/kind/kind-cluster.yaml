@@ -1,0 +1,46 @@
+# The cluster itself, which is the one thing a manifest cannot describe:
+#
+#   kind create cluster --name roomlock --config infra/k8s/overlays/kind/kind-cluster.yaml
+#
+# A default `kind create cluster` works for everything in this deployment except the Ingress, which
+# needs two things a default node does not have: the label ingress-nginx's installer schedules its
+# controller onto, and host ports 80/443 forwarded into the node so a browser on the laptop can reach
+# it. Both are node properties, fixed at creation - there is no patching them afterwards, which is why
+# this file exists next to the overlay rather than being a paragraph in the README.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: roomlock
+
+# ONE NODE. A single-node cluster cannot demonstrate the two things the manifests are most careful
+# about: the PodDisruptionBudgets only constrain evictions during a drain, and there is nowhere to
+# drain to; the pod anti-affinity of each Deployment is `preferred`, so both replicas land on this node
+# and the preference is simply unsatisfied. Adding `- role: worker` twice below makes both real, at the
+# cost of two more containers' worth of memory.
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      # What ingress-nginx's kind deployment selects on. Without it the controller pod stays Pending.
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    # 8088/8443 rather than 80/443: the low ports need privileges on some machines, and 8080 is
+    # taken often enough that infra/.env.example already avoids it for the same reason.
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 8088
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 8443
+        protocol: TCP
+
+# NETWORK POLICY DOES NOT WORK ON THE DEFAULT CNI. kindnet, which a kind cluster installs unless told
+# otherwise, has historically not enforced NetworkPolicy at all: the objects in
+# base/network-policies.yaml are accepted, listed, and ignored. To actually see payment-service refuse
+# a connection from anything but booking-service, uncomment the two lines below and install a CNI that
+# enforces policy (Calico or Cilium) as the first step after creating the cluster - nothing else will
+# schedule until one is running.
+#
+# networking:
+#   disableDefaultCNI: true

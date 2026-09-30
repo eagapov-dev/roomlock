@@ -1,0 +1,174 @@
+# payment-service: the gRPC contract of payment-api on 9091, the refund consumer, HTTP 8081 for the
+# actuator. Reached by booking-service and by nothing else - network-policies.yaml is what enforces
+# that here, the way a single run.invoker binding enforces it in infra/gcp/iam.tf.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payment-service-config
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/part-of: roomlock
+data:
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/payment
+  SPRING_DATASOURCE_USERNAME: roomlock
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+  SERVER_SHUTDOWN: graceful
+  SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE: 20s
+---
+# Both ports on one Service, which is a thing Cloud Run cannot do: a Cloud Run service routes ingress
+# to exactly one container port, so infra/gcp/run.tf has to choose 9091 and leave the actuator
+# reachable only from inside the instance. Here 9091 and 8081 are just two ports of one Service, and
+# the split between "the contract" and "the health and metrics surface" is expressed by who is allowed
+# to talk to which - see network-policies.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: payment-service
+  ports:
+    - name: grpc
+      port: 9091
+      targetPort: grpc
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  # Two replicas, and what they buy is narrower than it looks.
+  #
+  # Safe: RefundRequestsListener is a consumer in group `payment-service`, so Kafka gives each
+  # partition to exactly one member - two replicas share the three partitions of
+  # roomlock.refund-requests.v1 rather than both handling the same record. A charge is idempotent on
+  # the booking id and a refund is decided against the payment row, so a rebalance that replays a
+  # record changes nothing.
+  #
+  # CONSUMER PARALLELISM IS CAPPED BY PARTITIONS. Three partitions means at most three members of this
+  # group ever receive anything; a fourth replica joins the group, is assigned nothing and idles -
+  # it costs a JVM and a connection pool and consumes no refunds. `KAFKA_NUM_PARTITIONS: 3` in
+  # kafka.yaml is that ceiling. Raising it means raising the partition count of the topic first
+  # (`kafka-topics.sh --alter --partitions`), and that changes which partition a key lands on, so
+  # the per-key ordering the contract relies on only holds for keys written after the change.
+  #
+  # NOT what the second replica buys: sharing the gRPC call load. booking-service builds one channel
+  # to `static://payment-service:9091`, a ClusterIP is balanced per TCP connection, and gRPC keeps
+  # that one connection open - so every Charge lands on whichever pod the channel reached. The second
+  # replica is refund capacity and a warm standby for when the first pod dies, not a second charge
+  # handler. Actually balancing the calls would mean a headless Service and a `dns:///` target with a
+  # round-robin load-balancing policy on the client channel, which is an application change and not
+  # a manifest change.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-service
+        app.kubernetes.io/part-of: roomlock
+      annotations:
+        prometheus.io/scrape: "true"
+        # 8081, the HTTP port. The gRPC port serves no metrics.
+        prometheus.io/port: "8081"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      serviceAccountName: payment-service
+      automountServiceAccountToken: false
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: payment-service
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: payment-service
+          image: roomlock/payment-service:dev
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          ports:
+            - name: grpc
+              containerPort: 9091
+            - name: http
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: payment-service-config
+          env:
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: roomlock-db
+                  key: app-password
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # All three probes read the HTTP port, never the gRPC one - the same choice the Cloud Run
+          # startup probe makes and for the same reason: /actuator/health is a real answer about
+          # Flyway and the datasource, where a TCP connect to 9091 only proves a socket is bound, and
+          # this way nothing depends on whether the gRPC health service is registered.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}

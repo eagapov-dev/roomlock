@@ -1,0 +1,50 @@
+# ONE INGRESS, FOR ONE SERVICE. booking-service is the only thing in this deployment a client talks
+# to: payment-service serves a contract to booking-service, notification-service serves nothing at
+# all, and neither has any business being routable from outside the cluster. The other two shapes say
+# the same thing differently - compose publishes host ports for all three because a developer needs
+# them, and infra/gcp/run.tf sets INGRESS_TRAFFIC_INTERNAL_ONLY plus an IAM invoker list. The absence
+# of two more Ingress objects here is the statement.
+#
+# WHY INGRESS AND NOT GATEWAY API. Gateway API is the better design - typed roles (GatewayClass,
+# Gateway, HTTPRoute) instead of one object with a vendor-annotation escape hatch, and route
+# attachment that a platform team can delegate safely. It is also not installable in this shape:
+# Gateway API ships as CRDs, so on a cluster without them applied a `Gateway` manifest is rejected by
+# the API server outright, and it needs a controller and a GatewayClass on top. `networking.k8s.io/v1`
+# Ingress is built in - every cluster accepts this object. That is the whole argument: the manifest
+# that validates against a plain `kind` cluster wins over the manifest that needs two prerequisites
+# explained before a reader can apply it.
+#
+# What an Ingress object is NOT: a proxy. It is a routing intent that does nothing until an ingress
+# controller reads it. On a stock `kind` cluster there is none, so this applies cleanly and then sits
+# there with no address - which is why the README's smoke test uses `kubectl port-forward` and treats
+# the Ingress as the optional step.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: booking-service
+  labels:
+    app.kubernetes.io/name: booking-service
+    app.kubernetes.io/part-of: roomlock
+spec:
+  # No ingressClassName here on purpose: the class is a property of the cluster, not of the
+  # application, and naming one that does not exist would make this object silently dead. The kind
+  # overlay patches in `nginx`, which is what the README installs.
+  #
+  # No `tls:` block either. There is no certificate, and a demonstration cluster that pretended to
+  # have one would be worse than one that plainly does not. In a real cluster this is where
+  # cert-manager's annotation and a Secret name go - and note that booking-service authenticates
+  # nothing, so exposing it over the internet is the same decision infra/gcp/README.md refuses to
+  # take by default with `booking_service_public = false`.
+  rules:
+    # No host, which matches any Host header. That is defensible here because this is the only
+    # Ingress in the cluster; a second one would make the routing depend on which controller wins,
+    # and both would then need real hostnames.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: booking-service
+                port:
+                  name: http

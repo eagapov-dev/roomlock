@@ -1,0 +1,230 @@
+# Prometheus, scraping the three services by pod discovery and annotations.
+#
+# ANNOTATIONS, NOT A ServiceMonitor, and the reason is the target cluster. A `ServiceMonitor` is a
+# custom resource owned by the Prometheus Operator: on a cluster without that operator installed the
+# CRD does not exist, so `kubectl apply` of a ServiceMonitor is rejected by the API server and
+# `kubeconform` cannot validate it either - it is not part of any Kubernetes schema. Requiring an
+# operator (a few hundred more objects, its own CRDs, its own upgrade story) so that three scrape
+# targets can be declared in a typed object is not a trade this deployment makes. Pod annotations plus
+# one relabel block are understood by a plain Prometheus, and the mechanism is visible in the config
+# below instead of inside a controller.
+#
+# What the operator would buy, for a reader who should know: ServiceMonitors are namespaced objects a
+# team can own without editing a central scrape config, they carry TLS and auth settings per target,
+# and the operator reloads and shards Prometheus for you. That is worth it at fifty services and not
+# at three.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: roomlock
+---
+# The one identity in this namespace that needs the Kubernetes API at all: pod discovery *is* an API
+# call. Read-only, and on pods only - not secrets, not nodes, not anything in other namespaces beyond
+# what `list` on pods implies.
+#
+# It is a ClusterRole rather than a Role because the pod SD endpoint Prometheus watches is
+# cluster-scoped even when the scrape config restricts itself to one namespace; the binding is what
+# keeps it honest, and the name carries the namespace so two copies of this deployment could not
+# collide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: roomlock-prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: roomlock
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: roomlock-prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: roomlock
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: roomlock-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    # kustomize rewrites this to the overlay's namespace; a ClusterRoleBinding subject has to name one
+    # because the binding itself is not in any namespace.
+    namespace: roomlock
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: roomlock
+data:
+  prometheus.yml: |
+    # The intervals of infra/prometheus.yml, kept identical so a dashboard panel's rate() window
+    # behaves the same in both shapes.
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+
+    scrape_configs:
+      - job_name: roomlock
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              # Only this namespace, so a pod elsewhere in the cluster carrying the same annotations
+              # is not silently scraped into this dashboard.
+              own_namespace: true
+
+        relabel_configs:
+          # THE DASHBOARD DEPENDS ON THIS BLOCK. infra/grafana/dashboards/roomlock.json selects every
+          # panel on a `service` label and its template variable is label_values(service) - a label
+          # that exists because infra/prometheus.yml attaches it by hand to three static targets.
+          # Under Kubernetes service discovery there is no such label: a target arrives with `job`
+          # (the scrape config's name, "roomlock"), `instance` (IP:port) and a pile of
+          # __meta_kubernetes_* labels that are dropped unless something copies them. So the fourth
+          # rule below copies app.kubernetes.io/name into `service`, and that one line is what keeps
+          # the existing dashboard working unchanged against this cluster.
+
+          # Scrape only pods that asked to be scraped.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+
+          # /actuator/prometheus, from the annotation rather than hardcoded - the path is the
+          # application's business, not the scraper's.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+
+          # The pod IP comes with no port; the annotation supplies it. Three services listen on three
+          # different ports (8080, 8081, 8082), which is why this cannot be a constant.
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+          # The label the dashboard selects on.
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: replace
+            target_label: service
+
+          # Which replica answered. New in this shape and unavoidable: with two booking-service pods
+          # every series exists twice, so a panel that was one line in the compose stack is two here.
+          # Most panels sum over it; the gauges do not, and roomlock_outbox_unpublished in particular
+          # is each pod's own COUNT over the same table, so the two lines coincide - and diverging
+          # lines there would mean the pods are looking at different databases.
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: roomlock
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: roomlock
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  # Recreate, not RollingUpdate: one pod with one storage directory, and two of them writing it at
+  # once is not a thing to arrange even briefly.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/part-of: roomlock
+    spec:
+      serviceAccountName: prometheus
+      # The exception to the rule the three services follow: this pod needs its token, because
+      # discovery is an API call.
+      automountServiceAccountToken: true
+      securityContext:
+        # 65534 (nobody) is the user the prom/prometheus image already runs as.
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          # The version of infra/docker-compose.yml.
+          image: prom/prometheus:v3.5.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # So editing the ConfigMap and POSTing /-/reload beats deleting the pod.
+            - --web.enable-lifecycle
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        # emptyDir, not a PVC: the metrics of a demonstration cluster are worth exactly as much as
+        # the cluster, and both go away together. A restart of this pod loses the history - which is
+        # also true of the compose stack the first time someone prunes its volumes.
+        - name: data
+          emptyDir: {}

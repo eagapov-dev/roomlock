@@ -1,0 +1,190 @@
+# PostgreSQL 16: one instance, three databases (booking, payment, notification), as in
+# infra/docker-compose.yml. A StatefulSet and not a Deployment, for the two reasons a StatefulSet
+# exists: the pod keeps its identity (postgres-0) and it keeps its volume across a restart or a
+# reschedule. A Deployment with a PVC would work with one replica and then quietly do the wrong
+# thing the moment anyone typed `--replicas=2`, because two pods would mount the same volume.
+#
+# THIS IS NOT HOW TO RUN POSTGRES. There is one instance, no replication, no failover, no backup and
+# no point-in-time recovery; a lost node is a lost database. The other two shapes are honest about
+# the same trade in opposite directions - compose has a single container because it is a laptop, and
+# infra/gcp/sql.tf buys a managed instance with automated backups. In a real cluster this file would
+# be a CloudNativePG `Cluster` or an external managed database. It is here because the point of
+# infra/k8s is to show the whole topology in one shape, and half a topology would not compare.
+#
+# Headless (clusterIP: None) on purpose: `postgres:5432` then resolves straight to the pod's own
+# address, and postgres-0.postgres.<namespace>.svc.cluster.local resolves as well. A ClusterIP would
+# add a layer of load balancing in front of exactly one pod, which buys nothing and hides which pod
+# answered.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: roomlock
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# The init script of infra/postgres/init/01-create-databases.sh, mounted where the postgres
+# entrypoint looks for it.
+#
+# DUPLICATION, DELIBERATE AND ANNOYING: this is a copy of that file, not a reference to it. A
+# ConfigMap can only be generated from a file inside the kustomization root, and reaching up into
+# ../postgres/init would need `--load-restrictor LoadRestrictionsNone` on every build - a flag that
+# turns off a safety check for the whole tree, to save one copy. The copy is the smaller cost; the
+# bill for it is that a change to the compose init script has to be made here too.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: roomlock
+data:
+  01-create-databases.sh: |
+    #!/bin/sh
+    # Runs once, on the first start of an empty data volume (docker-entrypoint-initdb.d).
+    # Database per service: booking, payment, notification, all owned by the application user.
+    set -eu
+
+    psql -v ON_ERROR_STOP=1 \
+      --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+      -v app_user="$ROOMLOCK_DB_USER" -v app_password="$ROOMLOCK_DB_PASSWORD" <<'SQL'
+    CREATE ROLE :"app_user" LOGIN PASSWORD :'app_password';
+    CREATE DATABASE booking OWNER :"app_user";
+    CREATE DATABASE payment OWNER :"app_user";
+    CREATE DATABASE notification OWNER :"app_user";
+    SQL
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: roomlock
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: roomlock
+    spec:
+      # Nothing here talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        # uid/gid 70 is the `postgres` user of the Alpine image itself, not an arbitrary id. That
+        # matters: the entrypoint only uses gosu when it starts as root, so as a non-root user it
+        # runs initdb directly and needs to own PGDATA and /var/run/postgresql - which uid 70
+        # already does in the image. An arbitrary uid would fail on the socket directory.
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        # The kubelet gives the mounted volume to this group, which is what makes an empty PVC
+        # writable by a non-root database on first start.
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # Not read-only: initdb and the server write outside PGDATA (/var/run/postgresql, and
+            # the temporary server of the init phase). Locking this down properly means an emptyDir
+            # per writable path, which is an operator's job.
+            readOnlyRootFilesystem: false
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_DB
+              value: postgres
+            # PGDATA one level below the mount point, not at it: initdb refuses a directory it does
+            # not own outright, and a volume root may carry entries a provisioner put there.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: roomlock-db
+                  key: superuser-password
+            # Read by the init script, exactly as infra/docker-compose.yml passes them.
+            - name: ROOMLOCK_DB_USER
+              value: roomlock
+            - name: ROOMLOCK_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: roomlock-db
+                  key: app-password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          # pg_isready against the `booking` database over TCP, the same check and the same reason as
+          # the compose healthcheck: during initialisation the entrypoint runs a socket-only
+          # temporary server, so this only passes once the init script has created the databases.
+          # Three services whose Flyway migrations run at startup depend on that ordering.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "booking"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "booking"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+          # TCP, not pg_isready: a liveness probe answers "restart this container", and a database
+          # busy enough to be slow to answer a query is not a database to restart.
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      # 0755 so the entrypoint executes the script rather than sourcing it - it has a shebang and a
+      # heredoc, and being executed is what it was written for. A ConfigMap's default 0644 would
+      # still work, but by a different mechanism than the compose stack uses.
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+        # No storageClassName: the cluster's default class provisions it. On kind that is
+        # `standard` (local-path-provisioner), which is a directory on the node - so the data
+        # survives a pod restart and does not survive `kind delete cluster`.
