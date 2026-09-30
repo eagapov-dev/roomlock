@@ -119,6 +119,10 @@ services:
       # The payment contract is served on gRPC inside this network; the default of application.yml
       # is the localhost of an IDE run.
       SPRING_GRPC_CLIENT_CHANNELS_PAYMENT_ADDRESS: static://payment-service:9091
+      # roomlock.locking.strategy (Spring relaxed binding): pessimistic, optimistic or constraint.
+      # The default is the one of application.yml, so the stack behaves as before without it, and
+      # comparing the three strategies here is a variable rather than a run outside the stack (D2).
+      ROOMLOCK_LOCKING_STRATEGY: ${ROOMLOCK_LOCKING_STRATEGY:-constraint}
     ports:
       - "${BOOKING_PORT:-8090}:8080"
     depends_on:

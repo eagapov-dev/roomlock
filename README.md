@@ -97,7 +97,15 @@ Run parameters are system properties of the Gradle invocation:
 | `roomlock.declinedPricePerNight` | `2500.00` | the same for the decline flow: above the threshold of the provider |
 | `roomlock.paymentMode` | `THRESHOLD` | label of the decision mode the provider runs with, reaches the names and the output |
 
-The strategy itself is chosen by the service, not by the load test: `roomlock.locking.strategy` is `pessimistic`, `optimistic` or `constraint` (`constraint` by default). The compose file has no hook for it, so run booking-service next to the stack (infrastructure only, service on port 8080) and pass the strategy as an environment variable:
+The strategy itself is chosen by the service, not by the load test: `roomlock.locking.strategy` is `pessimistic`, `optimistic` or `constraint` (`constraint` by default). The compose file passes `ROOMLOCK_LOCKING_STRATEGY` through to booking-service, so a containerised run compares the three without leaving the stack — put it in `infra/.env` to keep it across `up`s:
+
+```bash
+ROOMLOCK_LOCKING_STRATEGY=optimistic docker compose -f infra/docker-compose.yml up -d
+./gradlew :load-tests:gatlingRun --all --run-description "strategy=optimistic" \
+  -Droomlock.strategy=optimistic -Droomlock.users=100 -Droomlock.duration=60
+```
+
+Running booking-service next to the infrastructure is the other way (service on port 8080): no image rebuild after a code change, and it is what the CI job below does.
 
 ```bash
 docker compose -f infra/docker-compose.yml -f infra/docker-compose.ide.yml up -d
@@ -108,6 +116,6 @@ ROOMLOCK_LOCKING_STRATEGY=optimistic ./gradlew :booking-service:bootRun
   -Droomlock.users=100 -Droomlock.duration=60
 ```
 
-`SPRING_APPLICATION_JSON='{"roomlock":{"locking":{"strategy":"optimistic"}}}'` does the same.
+`SPRING_APPLICATION_JSON='{"roomlock":{"locking":{"strategy":"optimistic"}}}'` does the same in either.
 
 The HTML report of every run lands in `load-tests/build/reports/gatling/<simulation>-<timestamp>/index.html`. In CI the scenarios are a manual job: **Actions → Load tests → Run workflow**, with the strategy, the simulations of the run (all, the three hold scenarios, the three confirm-flow ones, or a single one), the payment decision mode, the user count and the duration as inputs; it starts booking-service and payment-service from their boot jars next to the infrastructure, never runs on a pull request, and uploads the reports and the service logs as artifacts.
