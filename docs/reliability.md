@@ -419,6 +419,34 @@ it is:
 
 See [architecture](architecture.md#the-payment-flow-in-code) for the class-by-class inventory.
 
+## Who may do what
+
+Every guarantee above is scoped to a `guest_id`, so it is worth being explicit about where that value
+comes from: the subject of the access token the request carries, and nowhere else.
+
+booking-service is an OAuth2 resource server. It validates an RS256 token against the JWK set of its
+configured issuer and mints none of its own. `HoldBookingRequest` has no `guestId` field — one sent
+anyway is 400 — and `GET`, `pay` and `cancel` operate on the caller's own booking only. Reading the
+catalog is open; writing it needs the `catalog:write` scope. The policy lives in one file,
+`ApiSecurityConfig`, and [architecture](architecture.md#authentication-and-authorization) explains each
+decision.
+
+What this changes about the guarantees of this document:
+
+| Guarantee | Before | Now |
+| --- | --- | --- |
+| `booking_guest_id_idempotency_key_key` | stopped one caller colliding with itself, on a `guest_id` the caller chose | the `guest_id` is the token subject, so the unique index now scopes a retry to a guest the caller cannot pick |
+| A charge | could be triggered by anybody who knew a booking id | is refused before the provider is asked at all, unless the booking belongs to the token's subject (`PaymentTransitions.ownedBy`) |
+| A cancellation, and the `RefundRequested` it writes | the same | the same: ownership is read before either UPDATE runs, so nobody refunds somebody else's stay |
+| A booking id | was a bearer token of sorts — knowing it was enough | is an id again: somebody else's booking answers 404, the same answer an id that never existed gets |
+
+Ownership answers **404 and not 403** deliberately. A 403 would confirm that the id exists, which is
+the one fact an attacker walking through ids is after. The two answers are identical down to the
+fields of the problem body, and `BookingOwnershipIntegrationTest` asserts that they are.
+
+Nothing here changes the sweeps. Hold expiry, the outbox and payment reconciliation act on rows rather
+than on requests, they carry no token, and they were never reachable from outside the process.
+
 ## What changes in the cloud
 
 The same mechanisms run on Google Cloud — three Cloud Run services, one Cloud SQL instance, Google
@@ -430,6 +458,7 @@ guarantees above is this.
 | What | Locally | Under the `cloud` profile |
 | --- | --- | --- |
 | Instances per service | one process | `min_instance_count = 1` with `max_instance_count` defaulting to 1 and `cpu_idle = false` (`infra/gcp/run.tf`, `infra/gcp/variables.tf`) — one always-on instance, because the sweeps are `@Scheduled` and a throttled instance stops sweeping |
+| Identity provider | Keycloak of `infra/docker-compose.yml`, realm imported from `infra/keycloak/roomlock-realm.json`, throwaway credentials, plain HTTP | whatever `OIDC_ISSUER_URI` and `OIDC_JWK_SET_URI` name — the cloud profile has no default for either, so a revision given neither answers 401 to everything rather than trusting somebody else's provider ([deployment](deployment.md)) |
 | Kafka | `PLAINTEXT` on `localhost:9094` | `SASL_SSL` with `OAUTHBEARER`: the broker authenticates the revision's service account through `GcpLoginCallbackHandler`, so there is no password anywhere |
 | Producer budget | `KafkaEventSender` awaits the ack for 30s | plus `delivery.timeout.ms: 20000` and `max.block.ms: 10000`, so the producer gives up *before* the sweep does and a broker that is gone shows up as a failed send whose row the next sweep republishes |
 | Connection pool | Hikari `maximum-pool-size: 10` | `${DB_POOL_SIZE:5}` per instance, with `connection-timeout: 5s` and `max-lifetime: 30m`, because Cloud Run runs many instances against one Cloud SQL tier and Cloud SQL maintenance moves the primary |
@@ -509,12 +538,29 @@ effect.
   runs. That is the right default — the money may have moved and only the provider knows — but there
   is no dead-end state, no alert of its own and no metric counting bookings that have been reconciled
   many times.
-- **There is no authentication anywhere, and `guestId` arrives in the request body.** Nothing in the
-  repository depends on Spring Security; `POST /api/v1/bookings` takes `guestId` as a field of
-  `HoldBookingRequest`, and `pay`, `cancel` and `GET /api/v1/bookings/{id}` take a booking id and
-  nothing else. So any caller can hold a room in any guest's name, and can pay for, cancel or read any
-  booking whose id it knows. Every idempotency guarantee above is scoped to a `guest_id` the caller
-  chose for itself: `booking_guest_id_idempotency_key_key` stops one caller from colliding with
-  itself, not one caller from acting as another. In the cloud, Cloud Run authentication in front of
-  payment-service and the ID token of `CloudRunAuthInterceptor` protect the *service-to-service* hop
-  only — nothing authenticates the person calling booking-service.
+- **Authentication exists now; what surrounds it does not.** A token is validated and a booking is
+  owned ([above](#who-may-do-what)), and that is where it stops.
+  - **No refresh handling.** An expired access token is a 401 and the client's own problem; nothing in
+    the repository stores or exchanges a refresh token. The local realm gives 30 minutes, which is
+    also the ceiling on a Gatling run that fetches one token before it starts.
+  - **No revocation and no introspection.** A token is good until its `exp`, whatever happened to the
+    user meanwhile. Making a stolen token useless before then would need a call to the provider on
+    every request, which is exactly what validating the signature locally avoids.
+  - **No rate limiting and no lockout.** Nothing slows down a caller asking for one booking id after
+    another; the 404 tells them nothing, and the ids are random UUIDs, but the requests are free.
+  - **No operator provisioning and no admin UI.** Who carries `catalog:write` is the identity
+    provider's business, and locally the answer is a client secret committed in a realm file. There is
+    no mechanism in this repository for granting or withdrawing it.
+  - **No roles beyond ownership.** A guest may act on their own bookings; there is no hotel staff, no
+    read-only auditor and nothing anybody may do to a *hotel's* bookings.
+  - **No audit trail of its own.** Who did what is in the application log and nowhere else — there is
+    no table, no event and no retention policy for it.
+  - **`/actuator/prometheus` is open**, for the reason
+    [architecture](architecture.md#authentication-and-authorization) gives: all three scrapers are
+    unauthenticated by construction. On Cloud Run with `booking_service_public = true` that makes the
+    metrics of the service readable by anybody who can reach its URL. It leaks rates and counts, not
+    guest data, and closing it means giving all three scrapers a credential — a change to
+    `infra/gcp/observability.tf` and to every scrape config, not to this service.
+  - Unchanged: in the cloud, Cloud Run authentication in front of payment-service and the ID token of
+    `CloudRunAuthInterceptor` protect the *service-to-service* hop, which is a separate mechanism from
+    the guest's token and always was.

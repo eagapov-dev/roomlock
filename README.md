@@ -16,10 +16,12 @@ Kafka topics. The same hold use case sits behind three interchangeable locking s
 pessimistic row lock, an optimistic version bump with retries, and a PostgreSQL exclusion constraint —
 and a profile removes the database guard so the application-level ones can be proven rather than
 assumed. Holds are idempotent per guest and key, every event crosses the wire through a transactional
-outbox, and both consumers plus the payment provider are idempotent.
+outbox, and both consumers plus the payment provider are idempotent. booking-service is an OAuth2
+resource server: the guest is the subject of the access token, and a booking can only be read, paid for
+or cancelled by the guest who made it.
 
 - [docs/architecture.md](docs/architecture.md) — modules, request flow, data ownership, the events and
-  their topics, and the booking lifecycle as a state machine
+  their topics, the booking lifecycle as a state machine, and who may do what to which booking
 - [docs/locking-strategies.md](docs/locking-strategies.md) — the three strategies, what each conflict
   costs, the `no-constraint` profile, and how the metrics and load tests compare them
 - [docs/reliability.md](docs/reliability.md) — idempotent holds, the transactional outbox, idempotent
@@ -40,7 +42,7 @@ Requires JDK 21 and Docker. Build the three service images (Jib, into the local 
 docker compose -f infra/docker-compose.yml up -d
 ```
 
-This starts PostgreSQL 16 (databases `booking`, `payment`, `notification`), Kafka in KRaft mode, Prometheus, Grafana and the three services. Host ports and local credentials are in `infra/.env.example`; the compose file has the same values as defaults, so copy it to `infra/.env` (git-ignored) only to change something, for example a port that is taken.
+This starts PostgreSQL 16 (databases `booking`, `payment`, `notification`), Kafka in KRaft mode, Keycloak, Prometheus, Grafana and the three services. Host ports and local credentials are in `infra/.env.example`; the compose file has the same values as defaults, so copy it to `infra/.env` (git-ignored) only to change something, for example a port that is taken.
 
 | Component | Host address |
 | --- | --- |
@@ -49,6 +51,7 @@ This starts PostgreSQL 16 (databases `booking`, `payment`, `notification`), Kafk
 | notification-service | http://localhost:8092 |
 | PostgreSQL | `localhost:5433`, user `roomlock` / `roomlock` |
 | Kafka | `localhost:9094` (inside compose: `kafka:9092`) |
+| Keycloak | http://localhost:8088, `admin` / `admin`, realm `roomlock` (see [Getting a token](#getting-a-token)) |
 | Prometheus | http://localhost:9090 (targets: `/targets`) |
 | Grafana | http://localhost:3000, `admin` / `admin`, dashboard RoomLock |
 
@@ -59,6 +62,43 @@ docker compose -f infra/docker-compose.yml -f infra/docker-compose.ide.yml up -d
 ```
 
 Stop and delete all data: `docker compose -f infra/docker-compose.yml down -v`.
+
+## Getting a token
+
+The API takes no anonymous callers. Reading the catalog is open; everything else needs an access token
+from the Keycloak of the stack, and booking-service validates it against that realm.
+
+A guest — holds a room, pays for it, cancels it:
+
+```bash
+TOKEN=$(curl -fsS -X POST http://localhost:8088/realms/roomlock/protocol/openid-connect/token \
+  -d grant_type=password -d client_id=roomlock-guest \
+  -d username=guest -d password=guest | jq -r .access_token)
+curl -fsS localhost:8090/api/v1/bookings/$BOOKING_ID -H "Authorization: Bearer $TOKEN" | jq .
+```
+
+An operator — creates hotels and adds rooms, which needs the `catalog:write` scope:
+
+```bash
+OPERATOR=$(curl -fsS -X POST http://localhost:8088/realms/roomlock/protocol/openid-connect/token \
+  -d grant_type=client_credentials -d client_id=roomlock-operator \
+  -d client_secret=roomlock-operator-secret | jq -r .access_token)
+curl -fsS -X POST localhost:8090/api/v1/hotels -H "Authorization: Bearer $OPERATOR" \
+  -H 'Content-Type: application/json' -d '{"name":"Hotel Wawel","city":"Krakow"}' | jq .
+```
+
+The guest is the **subject** of the token, so `POST /api/v1/bookings` takes no `guestId` — the body is
+`{"roomId": ..., "checkIn": ..., "checkOut": ...}` and a `guestId` sent anyway is answered 400. The
+`guest` user has a fixed id, `11111111-1111-4111-8111-111111111111`, which is the `guestId` every
+booking of a local run comes back with. Swagger UI on
+[localhost:8090/swagger-ui.html](http://localhost:8090/swagger-ui.html) has an **Authorize** button
+that takes either token.
+
+Credentials, clients and the realm file: [infra/keycloak/README.md](infra/keycloak/README.md). Tokens
+live 30 minutes. `/actuator/health` and `/actuator/prometheus` need no token — the probes and all three
+metric scrapers cannot present one; [architecture](docs/architecture.md#authentication-and-authorization)
+says why and what that costs. A deployment brings its own identity provider
+([deployment](docs/deployment.md)).
 
 ## Load tests
 
@@ -77,7 +117,11 @@ Gatling scenarios in `load-tests/src/gatling/java` put the same contention on th
 | `DeclineFlowSimulation` | the same funnel with a charge that is declined: 409 `payment-declined` and the booking read back as `CANCELLED` |
 | `IdempotentPaySimulation` | the same booking paid twice; both answers 200 with the same booking id and status `CONFIRMED`, so nobody is charged twice |
 
-Each run creates its own hotel and rooms over HTTP, so nothing is expected in the database. The expected 409s are counted per problem type and printed after the run — holds and charges in a tally of their own — and a run only fails on an unexpected status: a 5xx that is not the documented 503 `payment-unavailable`, or a 400. One simulation at a time: `--simulation=dev.roomlock.loadtest.ContentionSimulation` instead of `--all`.
+Each run creates its own hotel and rooms over HTTP, so nothing is expected in the database. It fetches
+**one** access token before the injection starts and sends it with every request: a token per virtual
+user would measure Keycloak rather than the locking strategy. One token means one guest for the whole
+run, which changes nothing about the contention — the idempotency key is still per user, and an
+overlapping stay is decided by the room and the night. The expected 409s are counted per problem type and printed after the run — holds and charges in a tally of their own — and a run only fails on an unexpected status: a 5xx that is not the documented 503 `payment-unavailable`, or a 400. One simulation at a time: `--simulation=dev.roomlock.loadtest.ContentionSimulation` instead of `--all`.
 
 The three confirm-flow scenarios pay over `POST /api/v1/bookings/{id}/pay`, so payment-service has to be up as well (it is part of the compose stack). Its decision is deterministic: `roomlock.payment.decision.mode` is `THRESHOLD` (decline above `decline-above-minor`, 1000.00 PLN by default), `APPROVE_ALL` or `DECLINE_ALL`. `DeclineFlowSimulation` therefore needs no reconfiguration — it prices its rooms at `roomlock.declinedPricePerNight` (2500.00), above the threshold, and the charge is declined on the amount alone. To force a decline in every scenario instead, run the provider in `DECLINE_ALL` and tell the load test which mode to expect:
 
@@ -99,6 +143,11 @@ Run parameters are system properties of the Gradle invocation:
 | `roomlock.pricePerNight` | `120.00` | price of those rooms, and so the total a one-night stay is charged |
 | `roomlock.declinedPricePerNight` | `2500.00` | the same for the decline flow: above the threshold of the provider |
 | `roomlock.paymentMode` | `THRESHOLD` | label of the decision mode the provider runs with, reaches the names and the output |
+| `roomlock.tokenUrl` | Keycloak of the stack | token endpoint the run fetches its access token from |
+| `roomlock.clientId` | `roomlock-operator` | client the run authenticates as; it needs `catalog:write` for the warmup |
+| `roomlock.clientSecret` | the realm's throwaway secret | secret of that client |
+| `roomlock.scope` | empty | scopes to ask for, if the issuer does not attach them by default |
+| `roomlock.token` | empty | an access token minted elsewhere; set it to skip the exchange entirely |
 
 The strategy itself is chosen by the service, not by the load test: `roomlock.locking.strategy` is `pessimistic`, `optimistic` or `constraint` (`constraint` by default). The compose file passes `ROOMLOCK_LOCKING_STRATEGY` through to booking-service, so a containerised run compares the three without leaving the stack — put it in `infra/.env` to keep it across `up`s:
 

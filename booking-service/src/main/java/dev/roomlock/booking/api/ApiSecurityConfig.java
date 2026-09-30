@@ -47,12 +47,13 @@ import org.springframework.security.web.access.AccessDeniedHandler;
  * that cannot present a token: the Cloud Run startup and liveness probes and the compose
  * healthcheck fetch health, and all three metric scrapers - Prometheus in {@code
  * infra/docker-compose.yml}, the Google Managed Prometheus collector sidecar in {@code
- * infra/gcp/observability.tf}, and a {@code prometheus.io/scrape} annotation on Kubernetes - scrape
- * the metrics with no credential configured anywhere. A scope on the metrics endpoint would not
- * fail loudly: Prometheus would show the target as down and the sidecar would silently drop the
- * samples, which is how a dashboard goes blank for a week before anybody notices. The exposure list
- * of {@code application.yml} publishes these two endpoints and nothing else, and {@code
- * anyRequest().denyAll()} below closes the rest.
+ * infra/gcp/observability.tf}, and the {@code prometheus.io/scrape} annotations of the Kubernetes
+ * manifests ({@code infra/k8s/base}, which lives on the {@code build/kubernetes} branch and not on
+ * this one) - scrape the metrics with no credential configured anywhere. A scope on the metrics
+ * endpoint would not fail loudly: Prometheus would show the target as down and the sidecar would
+ * silently drop the samples, which is how a dashboard goes blank for a week before anybody notices.
+ * The exposure list of {@code application.yml} publishes these two endpoints and nothing else, and
+ * {@code anyRequest().denyAll()} below closes the rest.
  */
 @Configuration(proxyBeanMethods = false)
 @EnableWebSecurity

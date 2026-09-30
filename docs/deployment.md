@@ -24,7 +24,8 @@ for existing rather than for being used, so an idle demonstration costs the same
 
 | Piece | Where | Notes |
 | --- | --- | --- |
-| booking-service | Cloud Run, HTTP on the ingress port | the only service a person calls |
+| booking-service | Cloud Run, HTTP on the ingress port | the only service a person calls, and the only one that validates a guest's access token |
+| the identity provider | **not here — bring your own** | nothing in `infra/gcp` runs one; booking-service is pointed at an existing issuer with `OIDC_ISSUER_URI` and `OIDC_JWK_SET_URI` (see below) |
 | payment-service | Cloud Run, **gRPC** on the ingress port (`h2c`) | internal ingress, authentication required |
 | notification-service | Cloud Run, HTTP on the ingress port | consumes only; nobody calls it |
 | `booking`, `payment`, `notification` | one Cloud SQL instance, private IP | one database per service, as locally |
@@ -139,10 +140,26 @@ missing.
 | `MANAGEMENT_PORT` | payment-service | optional, `8081`; the HTTP port that stays on localhost |
 | `PAYMENT_GRPC_ADDRESS` | booking-service | `dns:///<payment-service host>:443` |
 | `PAYMENT_AUDIENCE` | booking-service | `https://<payment-service host>` — the audience of the ID token |
+| `OIDC_ISSUER_URI` | booking-service | the issuer whose access tokens this deployment trusts, exactly as it appears in the `iss` claim |
+| `OIDC_JWK_SET_URI` | booking-service | where that issuer publishes its signing keys, e.g. `<issuer>/protocol/openid-connect/certs` for Keycloak or `<issuer>/discovery/v2.0/keys` for Entra ID |
 
 The four Kafka variables have working defaults, so a deployment only sets them to authenticate
-differently. `DB_PASSWORD`, `PAYMENT_GRPC_ADDRESS` and `PAYMENT_AUDIENCE` have none: a revision without
-them does not start, which is better than one that starts and cannot charge.
+differently. `DB_PASSWORD`, `PAYMENT_GRPC_ADDRESS`, `PAYMENT_AUDIENCE`, `OIDC_ISSUER_URI` and
+`OIDC_JWK_SET_URI` have none: a revision without them does not start, which is better than one that
+starts and cannot charge — or, for the last two, one that starts and trusts the wrong provider.
+
+**Bring your own identity provider.** booking-service is a resource server: it validates an RS256
+access token against a JWK set and issues nothing. Which provider that is, is a deployment decision and
+nothing in `infra/gcp` makes it — there is no Keycloak in the cloud profile, and the Keycloak of
+`infra/docker-compose.yml` is a local convenience whose credentials are committed in a realm file. Any
+OIDC provider works as long as it signs with RS256 and publishes a JWK set: Keycloak, Auth0, Okta,
+Entra ID, Cloud Identity Platform. Two things it has to be set up to do: put a stable subject in the
+token (a UUID subject becomes the guest id as it stands, anything else is mapped to one), and issue the
+`catalog:write` scope to whoever may write the catalog and to nobody else. Both URIs are spelled out
+rather than discovered from `<issuer>/.well-known/openid-configuration`, because the address the keys
+are fetched from may be an internal one and a value that is written down cannot surprise anybody.
+Neither is read before the first request that carries a token, so an unreachable issuer delays 401s
+rather than the rollout — see [runbook](runbook.md#every-request-answers-401).
 
 ## 3. The deploy
 
@@ -182,59 +199,99 @@ REGION=europe-central2
 BOOKING_URL="$(gcloud run services describe booking-service \
   --project "$PROJECT" --region "$REGION" --format 'value(status.url)')"
 
-# The services take no unauthenticated callers, so every request carries an ID token of the caller.
-# If booking-service was deployed public, the header is simply ignored.
-AUTH="Authorization: Bearer $(gcloud auth print-identity-token)"
+# Two tokens, two headers, and mixing them up is the first thing that goes wrong here.
+#
+# Cloud Run's IAM check reads X-Serverless-Authorization when it is present - that header exists
+# precisely so that Authorization stays free for the application. If booking-service was deployed
+# public (booking_service_public = true) this one is simply ignored.
+RUN_AUTH="X-Serverless-Authorization: Bearer $(gcloud auth print-identity-token)"
+
+# Authorization carries the guest's access token, which booking-service validates against
+# OIDC_ISSUER_URI and which has nothing to do with Google. Client credentials here because a script
+# has no browser; a real guest signs in and gets a token of their own. The client has to carry
+# catalog:write, because the two requests that follow write the catalog.
+# Which issuer the revision was actually pointed at, read from the revision rather than remembered.
+OIDC_ISSUER_URI="$(gcloud run services describe booking-service \
+  --project "$PROJECT" --region "$REGION" --format json \
+  | jq -r '.spec.template.spec.containers[0].env[]
+           | select(.name == "OIDC_ISSUER_URI") | .value')"
+
+OIDC_CLIENT_ID=roomlock-operator
+read -rsp 'client secret: ' OIDC_CLIENT_SECRET; echo
+
+TOKEN_URL="$(curl -fsS "$OIDC_ISSUER_URI/.well-known/openid-configuration" | jq -r .token_endpoint)"
+TOKEN="$(curl -fsS -X POST "$TOKEN_URL" \
+  -d grant_type=client_credentials -d scope=catalog:write \
+  -d client_id="$OIDC_CLIENT_ID" -d client_secret="$OIDC_CLIENT_SECRET" | jq -r .access_token)"
+
+AUTH="Authorization: Bearer $TOKEN"
 JSON='Content-Type: application/json'
+
+# Nothing below works without a token, so find that out here rather than three steps later.
+{ test -n "$TOKEN" && test "$TOKEN" != null; } \
+  && echo "issuer $OIDC_ISSUER_URI, token acquired" \
+  || echo 'NO TOKEN: check the client, its secret and whether it carries catalog:write'
 ```
+
+A `401` from any request below means the token, not the deployment: expired, signed by an issuer the
+revision was not pointed at, or refused because the revision cannot reach `OIDC_JWK_SET_URI`. A `403`
+with an HTML body and no `urn:roomlock:problem:` type is Cloud Run's IAM check, not booking-service —
+that is `X-Serverless-Authorization`. See [runbook](runbook.md#every-request-answers-401).
 
 ### The catalog
 
 ```bash
-HOTEL_ID="$(curl -fsS -X POST "$BOOKING_URL/api/v1/hotels" -H "$AUTH" -H "$JSON" \
+HOTEL_ID="$(curl -fsS -X POST "$BOOKING_URL/api/v1/hotels" \
+  -H "$RUN_AUTH" -H "$AUTH" -H "$JSON" \
   -d '{"name":"RoomLock Demo","city":"Warsaw"}' | jq -r .id)"
 
-ROOM_ID="$(curl -fsS -X POST "$BOOKING_URL/api/v1/hotels/$HOTEL_ID/rooms" -H "$AUTH" -H "$JSON" \
+ROOM_ID="$(curl -fsS -X POST "$BOOKING_URL/api/v1/hotels/$HOTEL_ID/rooms" \
+  -H "$RUN_AUTH" -H "$AUTH" -H "$JSON" \
   -d '{"number":"101","capacity":2,"pricePerNight":"120.00"}' | jq -r .id)"
 
 echo "hotel $HOTEL_ID room $ROOM_ID"
 ```
 
-Two `201`s with ids prove the HTTP layer, the Cloud SQL connection over the private IP, and that
-Flyway migrated the `booking` database on startup — a service that could not migrate would not have
-become healthy at all.
+Two `201`s with ids prove the token was accepted with its scope, the HTTP layer, the Cloud SQL
+connection over the private IP, and that Flyway migrated the `booking` database on startup — a service
+that could not migrate would not have become healthy at all. A `403` here with a
+`urn:roomlock:problem:forbidden` body is the one failure this step adds over the previous version of
+it: the token is valid and the client does not carry `catalog:write`.
 
 ### Hold the room
 
 ```bash
-GUEST_ID="$(uuidgen | tr 'A-Z' 'a-z')"
 KEY="demo-$(date +%s)"
 CHECK_IN="$(date -u -d '+1 day' +%F 2>/dev/null || date -u -v+1d +%F)"
 CHECK_OUT="$(date -u -d '+2 days' +%F 2>/dev/null || date -u -v+2d +%F)"
+STAY="{\"roomId\":\"$ROOM_ID\",\"checkIn\":\"$CHECK_IN\",\"checkOut\":\"$CHECK_OUT\"}"
 
 BOOKING_ID="$(curl -fsS -X POST "$BOOKING_URL/api/v1/bookings" \
-  -H "$AUTH" -H "$JSON" -H "Idempotency-Key: $KEY" \
-  -d "{\"roomId\":\"$ROOM_ID\",\"guestId\":\"$GUEST_ID\",\"checkIn\":\"$CHECK_IN\",\"checkOut\":\"$CHECK_OUT\"}" \
-  | jq -r .id)"
+  -H "$RUN_AUTH" -H "$AUTH" -H "$JSON" -H "Idempotency-Key: $KEY" \
+  -d "$STAY" | jq -r .id)"
 
 # The same request again, with the same key: a replay, not a second booking.
 curl -fsS -X POST "$BOOKING_URL/api/v1/bookings" \
-  -H "$AUTH" -H "$JSON" -H "Idempotency-Key: $KEY" \
-  -d "{\"roomId\":\"$ROOM_ID\",\"guestId\":\"$GUEST_ID\",\"checkIn\":\"$CHECK_IN\",\"checkOut\":\"$CHECK_OUT\"}" \
-  | jq '{id, status}'
+  -H "$RUN_AUTH" -H "$AUTH" -H "$JSON" -H "Idempotency-Key: $KEY" \
+  -d "$STAY" | jq '{id, guestId, status}'
 ```
 
 The first answer is `201` with `"status": "HELD"`. The second is **`200` with the same `id`** — the
 idempotent hold, working in the cloud. A `409` here would mean the replay was read as a competing
 request, which is the bug that idempotency exists to prevent.
 
+Note what the body does *not* say: there is no `guestId` in it. The guest is the subject of the token,
+and the `guestId` that comes back is that subject — adding the field to the request would be answered
+`400` with the field named. The retry replays because the *same token* sent the *same key*: the
+idempotency key is unique per guest, so the same key under a different token is a different request.
+
 ### Pay for it, then pay again
 
 ```bash
-curl -fsS -X POST "$BOOKING_URL/api/v1/bookings/$BOOKING_ID/pay" -H "$AUTH" \
+curl -fsS -X POST "$BOOKING_URL/api/v1/bookings/$BOOKING_ID/pay" -H "$RUN_AUTH" -H "$AUTH" \
   | jq '{id, status, totalPrice}'
 
-curl -fsS -X POST "$BOOKING_URL/api/v1/bookings/$BOOKING_ID/pay" -H "$AUTH" \
+curl -fsS -X POST "$BOOKING_URL/api/v1/bookings/$BOOKING_ID/pay" -H "$RUN_AUTH" -H "$AUTH" \
   | jq '{id, status, totalPrice}'
 ```
 
@@ -251,17 +308,33 @@ logs of payment-service — not by this answer, which is identical either way.
 ### Cancel the confirmed booking
 
 ```bash
-curl -fsS -X POST "$BOOKING_URL/api/v1/bookings/$BOOKING_ID/cancel" -H "$AUTH" \
+curl -fsS -X POST "$BOOKING_URL/api/v1/bookings/$BOOKING_ID/cancel" -H "$RUN_AUTH" -H "$AUTH" \
   | jq '{id, status, cancelReason}'
 
 sleep 10
-curl -fsS "$BOOKING_URL/api/v1/bookings/$BOOKING_ID" -H "$AUTH" | jq '{status, cancelReason}'
+curl -fsS "$BOOKING_URL/api/v1/bookings/$BOOKING_ID" -H "$RUN_AUTH" -H "$AUTH" \
+  | jq '{status, cancelReason}'
 ```
 
 `200` with `"status": "CANCELLED"` and `"cancelReason": "USER_CANCELLED"`. Cancelling a *confirmed*
 booking also writes a `RefundRequested` event to the outbox, so this one request is what proves the
 whole asynchronous half: outbox sweep → Kafka → payment-service refunds. The `sleep` is for the
 sweeps; the refund itself is checked in the logs.
+
+### That somebody else's booking does not exist
+
+```bash
+# A second token, of a different subject. Any client of the same issuer will do; here the same client
+# with a different scope would still be the same service account, so this needs a second identity -
+# a guest account of the provider, or a second client.
+# With only one identity available, skip this and read BookingOwnershipIntegrationTest instead.
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  "$BOOKING_URL/api/v1/bookings/$BOOKING_ID" -H "$RUN_AUTH" -H "Authorization: Bearer $OTHER_TOKEN"
+```
+
+`404`. Not `403`: the answer to a booking somebody else owns is the same answer an id that was never
+created gets, so nothing about it tells a caller whether the id is real. That is the whole point of
+the choice, and [architecture](architecture.md#authentication-and-authorization) says why.
 
 ### That the events arrived
 

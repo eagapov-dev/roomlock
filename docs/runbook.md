@@ -13,10 +13,12 @@ Two environments, and every section below gives the command for both.
 | Metrics | `curl -s localhost:8090/actuator/prometheus`, or Prometheus on `localhost:9090`, or the RoomLock dashboard in Grafana on `localhost:3000` | Managed Prometheus over PromQL — the `promql` shell function of [deployment](deployment.md#the-metrics) |
 | Logs | `docker compose -f infra/docker-compose.yml logs -f <service>` | `gcloud logging read` with `resource.labels.service_name="<service>"` |
 | Database | `docker compose -f infra/docker-compose.yml exec postgres psql -U roomlock -d booking` (also `-d payment`, `-d notification`) | the instance has **no public IP**; reach it through the Cloud SQL auth proxy with the `sql_instance_connection_name` output of `infra/gcp`. No procedure for this is committed. |
+| Tokens | Keycloak on `localhost:8088`, realm `roomlock` — the two commands that fetch one are in the [README](../README.md) | whatever `OIDC_ISSUER_URI` names; the deployment brings its own provider ([deployment](deployment.md#2-the-infrastructure)) |
 | Kafka | `docker compose -f infra/docker-compose.yml exec kafka /opt/kafka/bin/<tool>.sh --bootstrap-server kafka:9092 …` | the bootstrap address is reachable **only from inside the VPC** and the cluster accepts nothing but `SASL_SSL`/`OAUTHBEARER`, so the same tools need a client in the VPC configured the way the `cloud` profile is. `gcloud managed-kafka` administers topics; it does not read records. |
 
 Host ports of the local stack are the defaults of `infra/.env.example`: booking-service 8090,
-payment-service 8091 (gRPC 9091), notification-service 8092, PostgreSQL 5433 (`roomlock`/`roomlock`).
+payment-service 8091 (gRPC 9091), notification-service 8092, PostgreSQL 5433 (`roomlock`/`roomlock`),
+Keycloak 8088 (`admin`/`admin`).
 Services run from the IDE listen on 8080/8081/8082 instead.
 
 The four topics: `roomlock.booking-events.v1` and `roomlock.refund-requests.v1` (3 partitions each),
@@ -477,6 +479,50 @@ transaction ([reliability, known gaps](reliability.md#known-gaps)), so a slow ch
 connection and throttles the consumer directly. `hikaricp_connections_pending` and
 `hikaricp_connections_acquire_seconds` on `/actuator/prometheus` — the "Connection pool" row of the
 Grafana dashboard — say whether that is what is happening.
+
+## Every request answers 401
+
+`/actuator/health` is fine, the database is fine, and every call under `/api/v1` comes back
+`401 urn:roomlock:problem:unauthenticated`. booking-service validates an access token against the JWK
+set of `OIDC_ISSUER_URI` ([architecture](architecture.md#authentication-and-authorization)), and it
+deliberately does not say which of the reasons applied — so it has to be narrowed down from outside.
+
+Read the token first; the answer is usually in it.
+
+```bash
+# The payload of the token being sent. No verification, just the claims.
+printf '%s' "$TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{iss, sub, exp, scope}'
+
+# What the service was told to trust, and what the clock of the machine minting tokens thinks.
+date -u
+```
+
+Four causes, in the order they actually happen:
+
+| What you see | Cause | What to do |
+| --- | --- | --- |
+| `exp` is in the past, or within a minute of now | the token expired — the local realm gives 30 minutes, and a Gatling run fetches one token before it starts | get a new one; a run longer than the token's lifetime needs a longer `accessTokenLifespan` |
+| `iss` of the token differs from `OIDC_ISSUER_URI`, by so much as a trailing slash or `http` against `https` | the revision was pointed at a different issuer than the one that minted the token. Locally this is the compose case: Keycloak's `KC_HOSTNAME` pins `iss` to `localhost:8088`, and a token fetched from somewhere else carries something else | make the two strings identical. There is no normalisation and no wildcard |
+| all claims look right, and the service log has `An error occurred while attempting to decode the Jwt` with a connect timeout or an unknown host | **the issuer is unreachable from the service**, so the JWK set cannot be fetched. This is the first request's failure and not the rollout's: the keys are fetched lazily, so the revision started healthy and only then began refusing everything. In the cloud it means `OIDC_JWK_SET_URI` is outside what direct VPC egress routes (`egress = "PRIVATE_RANGES_ONLY"` in `infra/gcp/run.tf`) or the provider is down; in compose it means booking-service is still resolving `localhost` instead of `keycloak:8080` | `curl` the JWK set from where the service runs, not from your laptop: `docker compose -f infra/docker-compose.yml exec booking-service curl -fsS "$OIDC_JWK_SET_URI"`, or `gcloud run services describe` and check which URI the revision was given |
+| `iss` and `exp` are right, the issuer is reachable, and it still fails — often right after a laptop resumed from sleep or a VM's clock drifted | **clock skew**. A token whose `iat`/`nbf` is in the service's future, or whose `exp` has already passed by the service's clock, is refused with no allowance beyond Spring Security's default 60s | fix the clock on whichever side is wrong (`date -u` on both), do not widen the allowance |
+
+Two answers that look like this one but are not:
+
+- **403 with `urn:roomlock:problem:forbidden`** — the token is valid and the endpoint wanted a scope it
+  does not carry. Only `POST /api/v1/hotels` and `POST /api/v1/hotels/{id}/rooms` ask for one
+  (`catalog:write`); everything else under `/api/v1/bookings` needs no scope at all.
+- **403 with an HTML body and no `urn:roomlock:problem:` type** — in the cloud that is Cloud Run's IAM
+  check answering before the container ever saw the request. That one reads
+  `X-Serverless-Authorization`, not `Authorization`; see
+  [deployment, verification](deployment.md#4-verification).
+
+And one that is nothing to do with tokens: **404 on a booking that exists.** A booking of another guest
+answers 404 on purpose, so that nothing about the answer says whether the id is real. Check the `sub`
+of the token against `guest_id` of the row before looking for a bug.
+
+```sql
+SELECT id, guest_id, status FROM booking WHERE id = '<booking id>';
+```
 
 ## Rolling back
 
