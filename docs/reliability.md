@@ -4,12 +4,19 @@ Each mechanism below exists because of one specific failure. The failure is name
 mechanism follows. Nothing here needs distributed transactions — every guarantee is a unique
 constraint, a conditional `UPDATE`, or a sweep that finishes what a crash interrupted.
 
+Companion documents: [architecture](architecture.md), [locking strategies](locking-strategies.md),
+[runbook](runbook.md) for the procedures an on-call person runs against these mechanisms, and
+[deployment](deployment.md) for the Google Cloud deployment
+[one section below](#what-changes-in-the-cloud) summarises.
+
 | Failure | Defence | Where |
 | --- | --- | --- |
 | A client retries a hold it never got an answer to, and gets a second booking | hold idempotency on `(guest_id, idempotency_key)` plus a stored request hash | `booking-service/src/main/java/dev/roomlock/booking/hold/HoldService.java`, `booking-service/src/main/resources/db/migration/V2__create_booking.sql` |
 | A client reuses one key for a different request | the request hash refuses it with 409 instead of replaying a wrong answer | `booking-service/src/main/java/dev/roomlock/booking/hold/RequestHash.java` |
 | The booking commits and the event is lost, or the event goes out and the booking rolls back | transactional outbox: the event is written in the booking's transaction | `booking-service/src/main/java/dev/roomlock/booking/outbox/OutboxWriter.java`, `booking-service/src/main/resources/db/migration/V3__create_outbox_event.sql` |
 | The process dies between publishing an event and marking it published | send first, mark second — the event is sent again rather than lost | `booking-service/src/main/java/dev/roomlock/booking/outbox/OutboxPublisher.java` |
+| Two booking-service instances sweep the outbox at once and publish one booking's events out of order | the publisher lease: a conditional upsert of a single row, so one instance sweeps and an unrenewed lease is taken over | `booking-service/src/main/java/dev/roomlock/booking/infra/PublisherLease.java`, `booking-service/src/main/resources/db/migration/V6__create_outbox_lease.sql` |
+| `outbox_event` grows for as long as the service runs | published events older than `roomlock.outbox.retention.older-than` are deleted in bounded batches, on a trigger of their own | `OutboxEventRepository.deletePublishedBefore`, `booking-service/src/main/java/dev/roomlock/booking/outbox/OutboxProperties.java` |
 | Kafka redelivers an event and the guest is told twice | `notification.event_id` unique, claimed before the send | `notification-service/src/main/java/dev/roomlock/notification/notify/NotificationService.java`, `notification-service/src/main/resources/db/migration/V1__create_notification.sql` |
 | Kafka redelivers a refund, or the booking service retries `Charge`, and the guest is charged twice | booking id is the idempotency key of both `Charge` and `Refund` | `payment-service/src/main/java/dev/roomlock/payment/payments/PaymentService.java`, `payment-service/src/main/resources/db/migration/V1__create_payment.sql` |
 | A hold is abandoned and its room is blocked forever | the hold expiry sweep | `booking-service/src/main/java/dev/roomlock/booking/lifecycle/LifecycleService.java` |
@@ -86,13 +93,14 @@ sequenceDiagram
     S->>DB: INSERT / UPDATE booking
     S->>DB: INSERT outbox_event, published_at = NULL
   end
+  OP->>DB: upsert outbox_lease, mine or expired
   OP->>DB: SELECT WHERE published_at IS NULL ORDER BY created_at LIMIT batch
   OP->>K: send, key = bookingId, header event-type
   K-->>OP: ack from all replicas
   OP->>DB: UPDATE published_at WHERE id = ? AND published_at IS NULL
 ```
 
-Three design decisions, each with its own reason.
+Four design decisions, each with its own reason.
 
 ### The event is written inside the booking's transaction
 
@@ -108,6 +116,44 @@ with it. `LifecycleService.expireHolds` does the same for a whole batch — the 
 `expireHolds` hands back exactly the ids that were cancelled, and one event per id is written beside
 them in the same transaction, which is also why the sweep is batched: the transaction stays as short
 as the batch rather than as long as the backlog.
+
+### One instance sweeps at a time
+
+`publishBatch` does nothing at all unless it holds the lease:
+
+```java
+if (!lease.heldBy(instance, clock.instant(), leaseFor)) {
+  log.debug("Another instance holds the publisher lease, skipping this sweep");
+  return 0;
+}
+```
+
+`PublisherLease` is one row of `outbox_lease` (`db/migration/V6`) and one statement — an
+`INSERT ... ON CONFLICT (id) DO UPDATE` whose update is conditional:
+
+```sql
+WHERE outbox_lease.holder = excluded.holder OR outbox_lease.expires_at <= excluded.acquired_at
+```
+
+So the upsert affects a row in exactly two cases: this instance already holds the lease and is
+renewing it, or the current holder's lease has run out and is being taken over. Any other instance
+gets `0` back and skips the sweep. `OutboxPublisher` identifies itself with a `UUID` generated once
+per process, and the row is created by whichever instance asks first, so nothing has to seed it.
+`roomlock.outbox.lease` is `PT30S` and every sweep renews it, so the value only has to outlast one
+sweep, and a dead instance costs one lease period before another takes over.
+
+The reason is ordering, not duplication: `bookingId` is the Kafka key, so the events of one booking
+share a partition and have to reach it in the order they were written, which two instances publishing
+the same rows cannot promise.
+
+**What the lease does not promise.** Its javadoc is explicit: it *bounds* the window in which two
+instances can both publish, it does not close it. An instance that stalls long enough for its lease
+to expire may still be sending when the next one takes the lease over, and the duplicate that
+produces stays a consumer's business — every event carries an id for exactly that (rule K-3).
+Nothing fences the stalled sender off from the broker. See [known gaps](#known-gaps).
+
+Pruning takes no lease, deliberately: `prunePublished` only deletes rows that are already published,
+and deleting a row twice is deleting it once.
 
 ### The publisher sends before it marks
 
@@ -131,31 +177,64 @@ their order — and the event type in the `event-type` header. `KafkaEventSender
 contract types onto the two topics and throws for anything unknown, so a new contract record cannot be
 published to nowhere.
 
-### A refused event stops the sweep
+### A refused event stops its own booking, and nothing else
 
 ```java
 for (OutboxEvent event : pending) {
-  if (!publish(event)) {
-    break;
+  if (stopped.contains(event.getAggregateId())) {
+    continue;
   }
-  published++;
+  if (publish(event)) {
+    published++;
+  } else {
+    stopped.add(event.getAggregateId());
+  }
 }
 ```
 
 `publishBatch` reads the batch oldest-first (`ORDER BY created_at`, driven by the partial index
-`outbox_event_unpublished_idx ON outbox_event (created_at) WHERE published_at IS NULL`) and stops at
-the first event the broker refuses, rather than skipping it. The reason is ordering: the events of one
-booking are published in the order they were written, and continuing past a refusal would publish a
-`BookingCancelled` before the `BookingHeld` it follows. A consumer that sees a cancellation for a
-booking it never heard of has no way to recover the lost order.
+`outbox_event_unpublished_idx ON outbox_event (created_at) WHERE published_at IS NULL`). An event the
+broker refuses puts its `aggregate_id` — the booking — into `stopped`, and every later event of *that*
+booking in the batch is skipped; the events of every other booking keep going.
+
+The reason it stops at all is ordering, and the reason it stops only there is the same fact read the
+other way. `bookingId` is the Kafka key, so the events of one booking share a partition: continuing
+past a refusal within one booking would publish a `BookingCancelled` before the `BookingHeld` it
+follows, and a consumer that sees a cancellation for a booking it never heard of has no way to recover
+the lost order. Between bookings there is no order to keep, so one event the broker keeps refusing may
+not hold up the whole outbox behind it.
 
 A refusal also bumps `attempts` (`recordAttempt`) and increments `roomlock.outbox.failures`, so a stuck
-event can be told from a fresh one.
+event can be told from a fresh one. Below `roomlock.outbox.stuck-after` refusals it is a passing
+outage and is logged at WARN — `Outbox stopped at <type> of booking <id> after <n> attempt(s)`. At or
+above it, it is no longer an outage and `reportRefusal` logs at ERROR:
+`Outbox event <id> (<type> of booking <id>) has been refused <n> times and is holding up that booking`.
+It is still retried on every sweep, because an outage can outlast any cap and dropping a committed
+event is worse than waiting.
+
+### Published rows do not stay forever
+
+`OutboxPublisher.prunePublished` deletes published events older than
+`roomlock.outbox.retention.older-than` (`P7D`), at most `retention.batch-size` (1000) rows per run, on
+the separate `roomlock.outbox.retention.interval` (`PT1H`) trigger of `OutboxScheduler.prune`. The
+statement is `OutboxEventRepository.deletePublishedBefore`: a `DELETE ... WHERE id IN (SELECT ...
+WHERE published_at IS NOT NULL AND published_at < ? ORDER BY published_at LIMIT ?)`, so a first prune
+of a large table does not hold one statement for minutes. A run that deleted anything logs
+`Outbox pruned <n> published event(s) older than <instant>` at INFO.
+
+The reasoning of the repository javadoc: an outbox is a queue, not a history — the event is on the
+topic, and keeping the row forever grows the table that the partial unpublished index and the backlog
+gauge live in. A week is chosen so a human debugging yesterday's incident still finds the row.
 
 **Observability.** `OutboxMetrics` publishes `roomlock.outbox.published` and
-`roomlock.outbox.failures` as counters and `roomlock.outbox.unpublished` as a gauge over
-`countByPublishedAtIsNull()` — the backlog, which a dashboard watches instead of guessing the lag. The
-Grafana dashboard has an "Outbox" row with the backlog and the published/failed rates.
+`roomlock.outbox.failures` as counters, and two gauges: `roomlock.outbox.unpublished` over
+`countByPublishedAtIsNull()` — the backlog, which a dashboard watches instead of guessing the lag —
+and `roomlock.outbox.stuck` over `countByPublishedAtIsNullAndAttemptsGreaterThanEqual(stuckAfter)`,
+the waiting events the broker keeps refusing. The Grafana dashboard
+(`infra/grafana/dashboards/roomlock.json`) has an "Outbox" row with the backlog and the
+published/failed rates; `roomlock.outbox.stuck` is exported but has no panel, and is read by PromQL in
+[deployment](deployment.md#the-metrics) instead. [runbook](runbook.md#the-outbox-is-not-draining) reads
+all four when the outbox is behind.
 
 ## Idempotent consumers
 
@@ -216,6 +295,12 @@ The event type is read from a header rather than from the payload precisely so t
 unreadable record is an ordinary exception thrown by the listener, not a deserialization failure the
 container has to be configured to survive.
 
+The `ConsumerRecordRecoverer` logs `Parking record from <topic>-<partition> offset <offset> on the
+dead-letter topic: <message>` at ERROR before it forwards, so the source offset of a parked record is
+in the service log as well as in the headers the recoverer adds. Nothing consumes the dead-letter
+topics: reading and replaying one is a manual procedure, documented in
+[runbook](runbook.md#dead-letter-topics).
+
 ## The idempotent charge and refund
 
 **The failure.** `Charge` is a synchronous call that moves money. booking-service may retry it — after
@@ -272,43 +357,98 @@ database contradicts itself.
 
 ## Sweeps that clean up what a crash left behind
 
-Neither the outbox nor a hold depends on the request that created it still being alive. Both are
-finished by a scheduled sweep, and both sweeps are `@Profile("!test")` along with `SchedulingConfig`
-itself, so under the `test` profile no `@Scheduled` task is registered at all and a test drives the use
-case directly with a `MutableClock` (rules SP-9, T-7).
+Nothing in the outbox, a hold or a charge depends on the request that created it still being alive.
+Each is finished by a scheduled sweep, and every scheduler is `@Profile("!test")` along with
+`SchedulingConfig` itself, so under the `test` profile no `@Scheduled` task is registered at all and a
+test drives the use case directly with a `MutableClock` (rules SP-9, T-7).
 
-| Sweep | Interval / batch | What it repairs |
+| Trigger → use case | Interval / batch | What it repairs |
 | --- | --- | --- |
-| `OutboxScheduler` → `OutboxPublisher.publishBatch` | `roomlock.outbox.interval` = `PT1S`, `batch-size` 100 | every committed event that was not published yet — including events whose publishing attempt died mid-flight |
+| `OutboxScheduler.publish` → `OutboxPublisher.publishBatch` | `roomlock.outbox.interval` = `PT1S`, `batch-size` 100, under a lease of `roomlock.outbox.lease` = `PT30S` | every committed event that was not published yet — including events whose publishing attempt died mid-flight |
+| `OutboxScheduler.prune` → `OutboxPublisher.prunePublished` | `roomlock.outbox.retention.interval` = `PT1H`, `older-than` `P7D`, `batch-size` 1000 | nothing: housekeeping. It deletes published rows so the table, its partial index and the two `COUNT` gauges stay small. Takes no lease. |
 | `HoldExpiryScheduler` → `LifecycleService.expireHolds` | `roomlock.hold.expiry.interval` = `PT30S`, `batch-size` 500 | `HELD` bookings past `hold_expires_at` (`roomlock.hold.ttl` = 10m from creation), cancelled with `HOLD_EXPIRED` so the room is released |
+| `PaymentReconcileScheduler` → `PaymentReconciler.reconcileBatch` | `roomlock.payment.reconcile.interval` = `PT10S`, `after` `1m`, `batch-size` 100 | bookings left `PAYING` longer than `after`: `Charge` is asked again and the answer applied through the same conditional transitions a request uses |
 
-Both intervals are ISO-8601 strings because `@Scheduled(fixedDelayString = ...)` reads the same
-property the `@ConfigurationProperties` record binds as a `Duration`. Both are `fixedDelay`, counted
-from the end of the previous sweep, so a slow sweep cannot overlap itself.
+Every interval is an ISO-8601 string because `@Scheduled(fixedDelayString = ...)` reads the same
+property the `@ConfigurationProperties` record binds as a `Duration`. Every one is `fixedDelay`,
+counted from the end of the previous sweep, so a slow sweep cannot overlap itself.
 
 The hold expiry sweep is the guarantee behind the whole hold model: a client that starts a booking and
 disappears costs the room for at most `roomlock.hold.ttl`. `FOR UPDATE SKIP LOCKED` inside its CTE
 means a row another transaction is currently writing is passed over rather than waited on, and the
 next sweep picks it up — so the sweep never blocks on, or fights with, a live request.
 
+The reconciliation sweep claims its batch differently, because the work it does happens *after* the
+claiming transaction has committed: `BookingRepository.leaseStalePayments` picks the oldest `PAYING`
+rows whose `payment_started_at` is older than `roomlock.payment.reconcile.after` with
+`FOR UPDATE SKIP LOCKED`, and then **re-stamps `payment_started_at` to now** and returns the ids. That
+re-stamp is the lease: the age of a row it took starts again, so no later sweep and no other instance
+picks the same booking up until `after` has passed once more. A row lock could not do that, since the
+charge runs outside the transaction that took the lock. The real guard stays the same one the whole
+flow rests on — `Charge` is idempotent on the booking id, so a sweep that does race another one asks
+the same question and loses the conditional `UPDATE`.
+
+`roomlock.payment.reconcile.after` (`1m`) is deliberately well past `roomlock.payment.deadline`
+(`3s`), so a sweep never takes over a booking whose request is still waiting for an answer.
+
 ## The payment flow
 
-The booking side of the payment flow is being implemented in parallel with this document and is **not
-in `feat/booking-outbox`**. The reliability argument of the target flow, for reference:
+The whole flow is in place on both sides. Its reliability argument, which is why it is shaped the way
+it is:
 
 - `POST /api/v1/bookings/{id}/pay` moves `HELD → PAYING` with a conditional `UPDATE`, then calls
   `Charge` over gRPC, then `PAYING → CONFIRMED` (writing `BookingConfirmed` to the outbox) or
   `PAYING → CANCELLED` with `PAYMENT_DECLINED` (writing `BookingCancelled`).
-- A call that never came back leaves the booking in `PAYING`. A scheduled sweep asks `Charge` again,
-  which is safe for exactly one reason: the booking id is the idempotency key, so the second call is
-  answered with the first decision and no second charge happens. `booking.payment_started_at` and
-  `booking_status_payment_started_at_idx` already exist in `db/migration/V2` for that sweep.
+  `booking-service/src/main/java/dev/roomlock/booking/payment/PaymentService.java` is deliberately
+  **not** `@Transactional`: each transition is a transaction of `PaymentTransitions` and the charge sits
+  between them, because a network round trip inside a transaction would hold a connection of a pool of
+  ten for its whole duration.
+- A call that never came back leaves the booking in `PAYING`, and `PaymentReconciler` asks `Charge`
+  again. That is safe for exactly one reason: the booking id is the idempotency key, so the second call
+  is answered with the first decision and no second charge happens. `booking.payment_started_at` and
+  `booking_status_payment_started_at_idx` (`db/migration/V2`) are what the sweep reads.
+- `PayResult.ProviderUnavailable` is 503 `payment-unavailable` and logs
+  `Booking <id> stays PAYING, the provider gave no answer: <status>` at WARN. A client may simply
+  retry `POST .../pay`: `PaymentService.pay` finds the row already `PAYING` and asks the provider
+  again rather than refusing, which is the retry the 503 asked for.
 - Cancelling a `CONFIRMED` booking writes both `BookingCancelled` and `RefundRequested` in the
-  cancellation's transaction; payment-service consumes `RefundRequested` and refunds idempotently.
-  Today `LifecycleService.cancel` refuses a `CONFIRMED` booking with 409 `booking-not-cancellable`.
+  cancellation's transaction (`LifecycleService.cancel`, two conditional `UPDATE`s rather than one so
+  the two endings can owe the guest different things); payment-service consumes `RefundRequested` and
+  refunds idempotently. A `PAYING` booking is still refused with 409 `booking-not-cancellable`,
+  because a charge is in flight and only the payment flow may decide how it ends.
 
-Everything the payment side of that story needs is already complete and tested in payment-service; see
-[architecture](architecture.md#what-is-here-and-what-is-landing-next) for the full inventory.
+See [architecture](architecture.md#the-payment-flow-in-code) for the class-by-class inventory.
+
+## What changes in the cloud
+
+The same mechanisms run on Google Cloud — three Cloud Run services, one Cloud SQL instance, Google
+Managed Service for Apache Kafka — and every revision runs with `SPRING_PROFILES_ACTIVE=cloud`, which
+activates the `cloud` document at the end of each `src/main/resources/application.yml`. The full
+procedure, its variables and its caveats are [deployment](deployment.md); what matters to the
+guarantees above is this.
+
+| What | Locally | Under the `cloud` profile |
+| --- | --- | --- |
+| Instances per service | one process | `min_instance_count = 1` with `max_instance_count` defaulting to 1 and `cpu_idle = false` (`infra/gcp/run.tf`, `infra/gcp/variables.tf`) — one always-on instance, because the sweeps are `@Scheduled` and a throttled instance stops sweeping |
+| Kafka | `PLAINTEXT` on `localhost:9094` | `SASL_SSL` with `OAUTHBEARER`: the broker authenticates the revision's service account through `GcpLoginCallbackHandler`, so there is no password anywhere |
+| Producer budget | `KafkaEventSender` awaits the ack for 30s | plus `delivery.timeout.ms: 20000` and `max.block.ms: 10000`, so the producer gives up *before* the sweep does and a broker that is gone shows up as a failed send whose row the next sweep republishes |
+| Connection pool | Hikari `maximum-pool-size: 10` | `${DB_POOL_SIZE:5}` per instance, with `connection-timeout: 5s` and `max-lifetime: 30m`, because Cloud Run runs many instances against one Cloud SQL tier and Cloud SQL maintenance moves the primary |
+| Shutdown | whatever the JVM does | `server.shutdown: graceful` and `spring.lifecycle.timeout-per-shutdown-phase: 20s`, so an in-flight request, charge or sweep finishes before the revision goes |
+| Migrations | Flyway at startup | Flyway at startup still, and safe for a rollout only because it locks its history table: of several instances starting at once exactly one migrates |
+
+**The publisher lease matters more here than locally.** A local run is one process, and the lease is
+close to free. A Cloud Run rollout is the opposite: the old revision keeps serving while the new one
+comes up, so two booking-service instances exist at the same time by design, each running its own
+`@Scheduled` outbox sweep. The lease is what keeps exactly one of them publishing across that window —
+and, once the old instance is gone without renewing, what lets the new one take the sweep over within
+one lease period instead of leaving the outbox stuck.
+
+Two things about the cloud consumers are worth knowing when reading the guarantees: both set
+`session.timeout.ms: 30000` and `heartbeat.interval.ms: 10000` so the broker notices a stopped
+revision in seconds rather than keeping its partitions for the default minute, and both keep
+`auto-offset-reset: earliest` — a fresh consumer group replays the topic from the start on purpose,
+because the `notification` row and the `payment` row, not the offset, are what prevent a duplicate
+effect.
 
 ## Known gaps
 
@@ -320,19 +460,32 @@ Everything the payment side of that story needs is already complete and tested i
   reported exclusion violation becomes `Busy` and never reaches the `KeyTaken` path that would read
   the winner's booking back. The sequential retry, which is the case a client actually hits after a
   timeout, is handled correctly by the pre-check.
-- **The outbox publisher assumes a single instance.** Nothing elects a leader and the pending query
-  takes no lock, so two booking-service replicas would both sweep and both publish the same events.
-  `markPublished` detects it afterwards and logs "was published twice", and consumers deduplicate, so
-  the system stays correct — but the duplication is by accident of the consumers, not by design.
-  `expireHolds` is safe under replicas because of `FOR UPDATE SKIP LOCKED`; the outbox has no
-  equivalent.
-- **A refused event still holds up its own booking, for good.** A refusal now stops that booking
-  alone, and an event refused `roomlock.outbox.stuck-after` times is logged as an error and counted by
+- **The publisher lease bounds the window in which two instances publish; it does not close it.**
+  `PublisherLease` says so itself. An instance that stalls long enough for its lease to expire — a long
+  GC pause, a frozen socket — may still be sending when the instance that took the lease over starts
+  publishing the same rows. Nothing fences the stalled sender off from the broker, so a duplicate
+  remains possible and remains a consumer's business (rule K-3); `markPublished` detects it afterwards
+  and logs "was published twice". What the lease does remove is the *steady-state* double publishing of
+  two healthy replicas, and the loss of per-booking ordering that came with it.
+- **The reason recorded outside this document is out of date.**
+  `infra/gcp/variables.tf` still caps `max_instance_count` at 1 with the explanation that "the outbox
+  publisher has no leader election", and `infra/gcp/README.md` still calls `Profiles.CLOUD` declared
+  and unused. Both statements predate the lease and the `cloud` profile documents. The cap itself is a
+  defensible default for a demonstration; only its stated reason is stale.
+- **A refused event still holds up its own booking, for good.** A refusal stops that booking alone,
+  and an event refused `roomlock.outbox.stuck-after` times is logged as an error and counted by
   `roomlock.outbox.stuck` — but it is retried forever and no tool moves it aside. Dropping a committed
   event is worse than waiting, so the resolution is deliberately a human one; there is no
   poison-message path and no backoff between sweeps.
-- **Published outbox rows are never deleted or archived.** `outbox_event` grows without bound, and
-  `roomlock.outbox.unpublished` runs a `COUNT` on the table on every Prometheus scrape (5s).
+  [runbook](runbook.md#the-outbox-is-not-draining) is how a human finds it, not a way to move it.
+- **Both outbox gauges run a `COUNT` on `outbox_event` on every Prometheus scrape (5s).**
+  `roomlock.outbox.unpublished` and `roomlock.outbox.stuck` are computed on demand. Pruning now keeps
+  the table small enough for that to be cheap in practice, which is not the same as being cheap by
+  construction: a long broker outage grows the unpublished set and both counts with it.
+- **`roomlock.outbox.stuck` has no Grafana panel.** It is exported and it is queried by PromQL in
+  [deployment](deployment.md#the-metrics), but the "Outbox" row of
+  `infra/grafana/dashboards/roomlock.json` shows the backlog and the published/failed rates only, so
+  locally the gauge has to be read from `/actuator/prometheus` or from Prometheus directly.
 - **notification-service calls the sender inside the database transaction.** That is what makes "a row
   without `sent_at` never committed" true and what makes a failed send roll the claim back, but it
   means a slow or hanging channel holds a Hikari connection for the duration. With the logging adapter
@@ -342,9 +495,26 @@ Everything the payment side of that story needs is already complete and tested i
   so the violation can be read after it rolled back); payment-service resolves its own race by reading
   the stored payment instead, which is correct, but a duplicate that loses the insert race on a
   *different* constraint would still surface as a listener failure.
-- **Nothing consumes the dead-letter topics.** `<topic>.DLT` is created in tests and written to in
-  production, but no service, tool or documented procedure reads them back.
+- **Nothing consumes the dead-letter topics automatically.** `<topic>.DLT` is created in tests and in
+  `infra/gcp/kafka.tf`, and written to in production, but no service and no scheduled job reads it
+  back. [runbook](runbook.md#dead-letter-topics) now documents how to look at a parked record and how
+  to replay one deliberately, which makes this a manual procedure rather than a blind spot — a smaller
+  gap, not a closed one. A record nobody looks at is still a record nobody handled.
 - **Reconciliation only runs from booking-service outwards.** The sweep finds a booking stuck in
   `PAYING` and asks the provider again, so an answer that was lost is recovered. Nothing looks the
   other way: an `APPROVED` payment whose booking row went missing, or a `CONFIRMED` booking with no
   payment row, would not be detected.
+- **The reconciliation sweep never gives up.** A provider that keeps answering nothing leaves the
+  booking `PAYING`, re-leased every `roomlock.payment.reconcile.after`, for as long as the service
+  runs. That is the right default — the money may have moved and only the provider knows — but there
+  is no dead-end state, no alert of its own and no metric counting bookings that have been reconciled
+  many times.
+- **There is no authentication anywhere, and `guestId` arrives in the request body.** Nothing in the
+  repository depends on Spring Security; `POST /api/v1/bookings` takes `guestId` as a field of
+  `HoldBookingRequest`, and `pay`, `cancel` and `GET /api/v1/bookings/{id}` take a booking id and
+  nothing else. So any caller can hold a room in any guest's name, and can pay for, cancel or read any
+  booking whose id it knows. Every idempotency guarantee above is scoped to a `guest_id` the caller
+  chose for itself: `booking_guest_id_idempotency_key_key` stops one caller from colliding with
+  itself, not one caller from acting as another. In the cloud, Cloud Run authentication in front of
+  payment-service and the ID token of `CloudRunAuthInterceptor` protect the *service-to-service* hop
+  only — nothing authenticates the person calling booking-service.

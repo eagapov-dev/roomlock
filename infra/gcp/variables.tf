@@ -176,7 +176,7 @@ variable "service_memory" {
 }
 
 variable "max_instance_count" {
-  description = "Upper bound on instances per service. Kept at 1 by default: the outbox publisher has no leader election, so a second booking-service replica would publish every event twice (docs/reliability.md, known gaps). Raise it only after that is fixed."
+  description = "Upper bound on instances per service. Kept at 1 by default because every instance is billed for CPU it never yields (cpu_idle = false), not because a second one would be unsafe: the outbox publisher holds a lease and the sweeps claim their batches with FOR UPDATE SKIP LOCKED."
   type        = number
   default     = 1
 }

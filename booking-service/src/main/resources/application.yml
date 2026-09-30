@@ -204,8 +204,9 @@ roomlock:
 # the `test` profile (SchedulingConfig), and they are what finishes a hold, a charge or an outbox row
 # after a crash. Nothing about them differs here, but they are @Scheduled rather than request-driven,
 # so the revision has to keep its CPU between requests: CPU always allocated and at least one
-# instance (docs/deployment.md). Several instances sweeping at once is safe - every sweep claims its
-# rows with a conditional UPDATE.
+# instance (docs/deployment.md). Several instances are safe, by two different mechanisms: hold expiry
+# and payment reconciliation claim their batches with FOR UPDATE SKIP LOCKED, while the outbox takes a
+# lease (PublisherLease) so one instance publishes at a time and the events of a booking keep order.
 server:
   # Cloud Run says which port to listen on; the port of a local run stays the fallback.
   port: ${PORT:8080}
