@@ -1,5 +1,6 @@
 package dev.roomlock.booking.api;
 
+import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import dev.roomlock.booking.api.Problems.Violation;
 import dev.roomlock.booking.domain.ResourceNotFoundException;
 import java.util.List;
@@ -42,10 +43,21 @@ class ApiExceptionHandler {
     return problems.validationError("The request body is invalid", violations);
   }
 
-  /** Malformed JSON never reaches a field, so the response carries no {@code errors} entry. */
+  /**
+   * Malformed JSON never reaches a field, so the response usually carries no {@code errors} entry.
+   * A field the request has no business sending does reach one, and is named: {@code guestId} was a
+   * field of a hold until the guest became the token subject, and a client that still sends it has
+   * to be told which field went away rather than left guessing at "not readable JSON".
+   */
   @ExceptionHandler(HttpMessageNotReadableException.class)
   ProblemDetail onUnreadableBody(HttpMessageNotReadableException exception) {
     log.debug("Unreadable request body", exception);
+    if (exception.getCause() instanceof UnrecognizedPropertyException unknown) {
+      Violation violation =
+          new Violation(unknown.getPropertyName(), "is not a field of this request");
+      return problems.validationError(
+          "The request body has a field this request does not take", List.of(violation));
+    }
     return problems.validationError("The request body is not readable JSON", List.of());
   }
 

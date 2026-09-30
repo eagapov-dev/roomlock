@@ -65,7 +65,7 @@ class CancellationOutboxTest {
     Booking booking = held();
 
     // when
-    lifecycle.cancel(booking.getId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
 
     // then
     // A hold was never paid for, so it asks for no refund.
@@ -98,10 +98,10 @@ class CancellationOutboxTest {
   void shouldWriteOneCancelledEventWhenBookingIsCancelledTwice() {
     // given
     Booking booking = held();
-    lifecycle.cancel(booking.getId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
 
     // when
-    lifecycle.cancel(booking.getId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(outbox.typesOf(booking.getId())).containsExactly(BOOKING_HELD, BOOKING_CANCELLED);
@@ -132,11 +132,11 @@ class CancellationOutboxTest {
   void shouldWriteCancellationAndRefundRequestWhenConfirmedBookingIsCancelled() throws Exception {
     // given
     Booking booking = held();
-    payments.pay(booking.getId());
+    payments.pay(booking.getId(), booking.getGuestId());
     clock.advance(Duration.ofMinutes(1));
 
     // when
-    lifecycle.cancel(booking.getId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(outbox.typesOf(booking.getId()))
@@ -155,11 +155,11 @@ class CancellationOutboxTest {
   void shouldWriteOneRefundRequestWhenConfirmedBookingIsCancelledTwice() {
     // given
     Booking booking = held();
-    payments.pay(booking.getId());
-    lifecycle.cancel(booking.getId());
+    payments.pay(booking.getId(), booking.getGuestId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
 
     // when
-    lifecycle.cancel(booking.getId());
+    lifecycle.cancel(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(outbox.typesOf(booking.getId()))
@@ -174,7 +174,7 @@ class CancellationOutboxTest {
     provider.declineEverything("INSUFFICIENT_FUNDS");
 
     // when
-    payments.pay(booking.getId());
+    payments.pay(booking.getId(), booking.getGuestId());
 
     // then
     assertThat(outbox.typesOf(booking.getId())).containsExactly(BOOKING_HELD, BOOKING_CANCELLED);

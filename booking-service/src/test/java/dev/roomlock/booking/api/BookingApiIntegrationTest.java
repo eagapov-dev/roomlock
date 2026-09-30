@@ -126,7 +126,6 @@ class BookingApiIntegrationTest {
   private ResponseEntity<String> postHold(HoldDraft draft) {
     Map<String, Object> body = new LinkedHashMap<>();
     body.put("roomId", draft.roomId());
-    body.put("guestId", draft.guestId());
     body.put("checkIn", draft.checkIn().toString());
     body.put("checkOut", draft.checkOut().toString());
     HttpHeaders headers = TestJwts.jsonBearer(TestJwts.guest(draft.guestId()));

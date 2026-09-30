@@ -6,6 +6,13 @@ spring:
       enabled: true
   flyway:
     locations: classpath:db/migration, classpath:db/constraint
+  jackson:
+    deserialization:
+      # A field no request record declares is a rejected request, not a shrug. Spring Boot's default
+      # is to ignore it, which was harmless while every field was only data - and is not harmless
+      # since guestId stopped being a field of a hold: a client that still sends it would otherwise
+      # be answered 201 for a booking made for somebody else than it named (HoldBookingRequest).
+      fail-on-unknown-properties: true
   jpa:
     open-in-view: false
     hibernate:

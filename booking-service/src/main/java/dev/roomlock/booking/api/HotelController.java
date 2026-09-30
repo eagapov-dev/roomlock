@@ -4,6 +4,7 @@ import dev.roomlock.booking.catalog.CatalogService;
 import dev.roomlock.booking.catalog.CreateHotelCommand;
 import dev.roomlock.booking.domain.Hotel;
 import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import java.net.URI;
@@ -33,6 +34,7 @@ class HotelController {
 
   @PostMapping
   @Operation(summary = "Create a hotel")
+  @SecurityRequirement(name = OpenApiConfig.BEARER)
   ResponseEntity<HotelResponse> create(@Valid @RequestBody CreateHotelRequest request) {
     Hotel hotel = catalog.createHotel(new CreateHotelCommand(request.name(), request.city()));
     URI location =

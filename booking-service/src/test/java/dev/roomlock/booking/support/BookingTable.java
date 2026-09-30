@@ -50,6 +50,14 @@ public class BookingTable {
     return booking.id();
   }
 
+  /**
+   * The guest the row belongs to. Pay and cancel act for a guest since the guest became the token
+   * subject, so a test that wrote a row straight to the table asks it who owns what it wrote.
+   */
+  public UUID guestId(UUID bookingId) {
+    return jdbc.queryForObject("SELECT guest_id FROM booking WHERE id = ?", UUID.class, bookingId);
+  }
+
   /** Raw value of the status column. */
   public String status(UUID bookingId) {
     return jdbc.queryForObject("SELECT status FROM booking WHERE id = ?", String.class, bookingId);
