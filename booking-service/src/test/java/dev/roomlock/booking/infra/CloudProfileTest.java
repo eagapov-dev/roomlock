@@ -3,9 +3,12 @@ package dev.roomlock.booking.infra;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.zaxxer.hikari.HikariConfig;
 import dev.roomlock.booking.Profiles;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
@@ -51,6 +54,39 @@ class CloudProfileTest {
 
     // then
     assertThat(poolSize).isEqualTo(5);
+  }
+
+  /**
+   * The pool settings have to bind to {@link HikariConfig}, not merely resolve. Its setters take a
+   * long of milliseconds, so a duration like {@code 5s} resolves perfectly well as a string and
+   * then fails the context at startup - which no assertion on a resolved property can see, and
+   * which nobody would find until a revision refused to start.
+   */
+  @Test
+  void shouldBindEveryPoolSettingToHikariWhenProfileIsCloud() {
+    // given
+    AtomicReference<HikariConfig> bound = new AtomicReference<>();
+
+    // when
+    new ApplicationContextRunner()
+        .withInitializer(new ConfigDataApplicationContextInitializer())
+        .withPropertyValues("spring.profiles.active=" + Profiles.CLOUD)
+        .withPropertyValues(ENVIRONMENT)
+        .run(
+            context ->
+                bound.set(
+                    Binder.get(context.getEnvironment())
+                        .bind("spring.datasource.hikari", Bindable.of(HikariConfig.class))
+                        .orElseThrow(
+                            () ->
+                                new AssertionError(
+                                    "spring.datasource.hikari is absent from the cloud document"))));
+
+    // then
+    HikariConfig pool = bound.get();
+    assertThat(pool.getMaximumPoolSize()).isEqualTo(5);
+    assertThat(pool.getConnectionTimeout()).isPositive();
+    assertThat(pool.getMaxLifetime()).isPositive();
   }
 
   @Test
