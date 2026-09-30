@@ -62,7 +62,8 @@ public class HoldService {
     if (previous.isPresent()) {
       return replayOf(previous.get(), requestHash, command);
     }
-    return resultOf(command, strategies.active().hold(attemptOf(command, room, requestHash)));
+    HoldOutcome outcome = strategies.active().hold(attemptOf(command, room, requestHash));
+    return resultOf(command, requestHash, outcome);
   }
 
   @Transactional(readOnly = true)
@@ -72,12 +73,12 @@ public class HoldService {
         .orElseThrow(() -> new ResourceNotFoundException(BOOKING, bookingId));
   }
 
-  private HoldResult resultOf(HoldCommand command, HoldOutcome outcome) {
+  private HoldResult resultOf(HoldCommand command, String requestHash, HoldOutcome outcome) {
     return switch (outcome) {
       case HoldOutcome.Inserted inserted -> new HoldResult.Held(inserted.booking());
-      case HoldOutcome.Busy busy -> new HoldResult.RoomBusy(command.roomId(), command.stay());
+      case HoldOutcome.Busy busy -> busyOrReplay(command, requestHash);
       case HoldOutcome.Contended contended -> new HoldResult.RoomContended(command.roomId());
-      case HoldOutcome.KeyTaken keyTaken -> replayOfRace(command);
+      case HoldOutcome.KeyTaken keyTaken -> replayOfRace(command, requestHash);
     };
   }
 
@@ -105,15 +106,40 @@ public class HoldService {
         : new HoldResult.IdempotencyKeyReused(command.idempotencyKey());
   }
 
+  /**
+   * A room reported busy is only busy while no request of this key holds it.
+   *
+   * <p>Two simultaneous holds of the same guest and the same key make the loser's row break {@code
+   * booking_guest_id_idempotency_key_key} and {@code booking_no_overlap} at once, and PostgreSQL
+   * names whichever of the two indexes it happened to check first. Believing that name would answer
+   * 409 {@code room-busy} to a client that already has the booking, so the question is asked
+   * instead: a booking under this key means a request of this key won and its answer is replayed;
+   * nothing under it means the room is held by somebody else.
+   *
+   * <p>Asked here rather than in the strategies because idempotency is the business of this use
+   * case and the strategies know nothing about keys - and because PESSIMISTIC and OPTIMISTIC owe
+   * the same replay, although their busy comes from their own overlap check rather than from a
+   * constraint.
+   */
+  private HoldResult busyOrReplay(HoldCommand command, String requestHash) {
+    return replayUnderKey(command, requestHash)
+        .orElseGet(() -> new HoldResult.RoomBusy(command.roomId(), command.stay()));
+  }
+
   /** A request with the same key won the race: its booking is the answer to this one as well. */
-  private HoldResult replayOfRace(HoldCommand command) {
-    return bookings
-        .findByGuestIdAndIdempotencyKey(command.guestId(), command.idempotencyKey())
-        .map(booking -> replayOf(booking, RequestHash.of(command), command))
+  private HoldResult replayOfRace(HoldCommand command, String requestHash) {
+    return replayUnderKey(command, requestHash)
         .orElseGet(
             () -> {
               log.warn("Idempotency key of room {} was taken and then released", command.roomId());
               return new HoldResult.RoomContended(command.roomId());
             });
+  }
+
+  /** The answer the booking of this guest and key carries, if the key has one by now. */
+  private Optional<HoldResult> replayUnderKey(HoldCommand command, String requestHash) {
+    return bookings
+        .findByGuestIdAndIdempotencyKey(command.guestId(), command.idempotencyKey())
+        .map(booking -> replayOf(booking, requestHash, command));
   }
 }

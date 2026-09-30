@@ -73,6 +73,10 @@ abstract class TransactionalHoldStrategy implements HoldStrategy {
   /**
    * {@code booking_no_overlap} means the room was taken while this attempt ran; {@code
    * booking_guest_id_idempotency_key_key} means a retry of the same request won the race.
+   *
+   * <p>A row can break both at once, and the error carries one code, so neither answer is the last
+   * word: whether a busy room is really busy or the client's own retry is decided by {@link
+   * HoldService}, which is the only one here that knows about idempotency keys.
    */
   private static HoldOutcome outcomeOf(DataIntegrityViolationException violation) {
     if (SqlState.EXCLUSION_VIOLATION.thrownBy(violation)) {

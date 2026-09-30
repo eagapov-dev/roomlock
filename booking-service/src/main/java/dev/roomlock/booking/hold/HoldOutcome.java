@@ -8,7 +8,10 @@ public sealed interface HoldOutcome {
   /** The HELD row is committed. */
   record Inserted(Booking booking) implements HoldOutcome {}
 
-  /** An active booking of the room covers a night of the stay. */
+  /**
+   * An active booking of the room covers a night of the stay. Whose booking that is stays open: the
+   * loser of two simultaneous holds of one idempotency key sees the same thing.
+   */
   record Busy() implements HoldOutcome {}
 
   /** Every attempt lost the race for the room against a concurrent hold. */
