@@ -1,0 +1,109 @@
+# The local cluster: one `kind` node on a developer's machine, images side-loaded from the local
+# Docker daemon, no registry and no cloud.
+#
+#   kubectl apply -k infra/k8s/overlays/kind
+#
+# What an overlay is for, and what it is not for. Everything here is a statement about *this cluster*
+# - how much memory one machine can spare, which ingress controller happens to be installed, how many
+# replicas fit. Nothing here changes what the application is or how it behaves; that lives in base/,
+# where a reader looking for the deployment's design finds it in one place. If a change would be true
+# of every cluster, it belongs in base/ instead.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Fewer replicas than base, and only because of the machine. base/ runs two of each service to make
+# the scaling argument concrete (see the comments on each Deployment); a single kind node running six
+# JVMs plus PostgreSQL, Kafka and Prometheus on a laptop is a machine that swaps. booking-service keeps
+# its two, because that is the one claim worth watching work: the publisher lease means only one of
+# the two publishes the outbox.
+#
+# Scaling the other two back up is `kubectl scale deployment/payment-service --replicas=2`, safely, up
+# to three - three partitions, so a fourth replica would idle.
+replicas:
+  - name: payment-service
+    count: 1
+  - name: notification-service
+    count: 1
+
+patches:
+  # --- The ingress class -----------------------------------------------------------------------
+  #
+  # base/ingress.yaml deliberately names no class: an Ingress with a class that has no controller is
+  # a dead object, and which controller exists is a property of the cluster. `nginx` is what the README
+  # installs into a kind cluster (ingress-nginx's own kind manifest), and it is the only reason this
+  # patch exists rather than the class being hardcoded in base.
+  #
+  # The Ingress is still optional. Without ingress-nginx installed, this object sits there with no
+  # address and the smoke test reaches booking-service by `kubectl port-forward` instead.
+  - target:
+      kind: Ingress
+      name: booking-service
+    patch: |-
+      - op: add
+        path: /spec/ingressClassName
+        value: nginx
+
+  # --- Room on one machine --------------------------------------------------------------------
+  #
+  # The requests come down so the pods actually schedule on a single node, and the memory *limit*
+  # comes down with them - which is a heap change, not only a cap: Jib builds these images with
+  # -XX:MaxRAMPercentage=75, so 768Mi here is a ~576Mi heap. That is enough for Spring Boot, Hibernate
+  # and a Kafka client and it is not enough to run the load tests in load-tests/ against; those belong
+  # against the compose stack, or against a cluster with base/'s numbers.
+  #
+  # The CPU request matters more than it looks: a JVM starting Flyway and Hibernate on 100m of
+  # guaranteed CPU is slow, and the startup probe's 150-second budget is what absorbs that. If pods
+  # here are killed before they ever answer, raise this before suspecting the application.
+  - target:
+      kind: Deployment
+      name: .*-service
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 384Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 768Mi
+
+  # Kafka's heap is not sized from the cgroup - the image sets -Xmx1G itself, so lowering the limit
+  # without lowering the heap is how you get an OOMKill instead of a smaller broker.
+  - target:
+      kind: StatefulSet
+      name: kafka
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: KAFKA_HEAP_OPTS
+          value: -Xmx512m -Xms512m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 384Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 1Gi
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 2Gi
+
+  # PostgreSQL on a laptop holds a demo's worth of rows. shared_buffers is left at the image default;
+  # this is a size, not a tuning exercise.
+  - target:
+      kind: StatefulSet
+      name: postgres
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 192Mi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 512Mi
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 1Gi

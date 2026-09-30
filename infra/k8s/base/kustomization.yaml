@@ -1,0 +1,36 @@
+# The whole deployment, in the order it reads rather than the order it starts: nothing here declares a
+# dependency, because Kubernetes has no `depends_on`. Applying this creates all of it at once and the
+# services crash-loop until PostgreSQL and Kafka answer - which is the model, not a flaw in it. The
+# startup probes (150 seconds of budget) and the restart backoff are what turn "not ready yet" into
+# "ready eventually", where the compose stack spells the same thing out with `depends_on:
+# service_healthy`.
+#
+# This base is not meant to be applied directly. It has no environment-specific truths in it - no
+# ingress class, no storage class, no resource numbers tuned for a laptop - so apply an overlay:
+#
+#   kubectl apply -k infra/k8s/overlays/kind
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Every object below lands here, and the ServiceAccount subject of the ClusterRoleBinding is rewritten
+# with it. An overlay that changes this value moves the whole deployment, including the Namespace
+# object itself.
+namespace: roomlock
+
+resources:
+  - namespace.yaml
+  - serviceaccounts.yaml
+  - secret.yaml
+  # Infrastructure the three services need.
+  - postgres.yaml
+  - kafka.yaml
+  # The services.
+  - booking-service.yaml
+  - payment-service.yaml
+  - notification-service.yaml
+  # What a cluster can say that the other two shapes cannot.
+  - ingress.yaml
+  - network-policies.yaml
+  - pod-disruption-budgets.yaml
+  # Observability.
+  - prometheus.yaml
