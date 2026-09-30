@@ -90,8 +90,11 @@ roomlock:
   locking:
     # pessimistic | optimistic | constraint (D2)
     strategy: constraint
-    # Attempts of a strategy that retries a lost race (optimistic).
-    max-attempts: 3
+    optimistic:
+      # Attempts of one hold; 1 disables retrying. Only the optimistic strategy retries a lost
+      # race, hence the prefix: the other two try once, and a conflict costs them waiting or a
+      # busy answer instead.
+      max-attempts: 3
 
 server:
   port: 8080

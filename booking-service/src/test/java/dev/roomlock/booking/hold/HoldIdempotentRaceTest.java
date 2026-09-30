@@ -132,7 +132,9 @@ class HoldIdempotentRaceTest {
   }
 
   private static HoldStrategies strategiesOf(HoldStrategy strategy) {
-    return new HoldStrategies(List.of(strategy), new LockingProperties(strategy.strategy(), 1));
+    return new HoldStrategies(
+        List.of(strategy),
+        new LockingProperties(strategy.strategy(), new LockingProperties.Optimistic(1)));
   }
 
   private static UUID heldBookingId(List<HoldResult> results) {
