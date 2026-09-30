@@ -175,6 +175,24 @@ class ApiSecurityIntegrationTest {
     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
   }
 
+  /**
+   * The Cloud Run startup and liveness probes read the groups of health, not health itself ({@code
+   * management.endpoint.health.probes.enabled} under the {@code cloud} profile), so the filter
+   * chain has to let those paths through as well. 404 rather than 403 is the whole assertion: the
+   * request reached the actuator, which under this profile has no such group to serve. A 403 would
+   * mean a revision whose probes never pass.
+   */
+  @ParameterizedTest
+  @ValueSource(strings = {"/actuator/health/liveness", "/actuator/health/readiness"})
+  void shouldNotBlockTheProbeGroupsOfHealthWhenRequestIsAnonymous(String path) {
+    // given
+    // when
+    ResponseEntity<String> response = rest.getForEntity(path, String.class);
+
+    // then
+    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+  }
+
   /** Nothing outside the documented contract is reachable, with or without a token. */
   @Test
   void shouldRefuseAnUndocumentedActuatorEndpointWhenTokenIsValid() throws Exception {
